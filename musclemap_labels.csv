@@ -1,0 +1,100 @@
+label_id,region,anatomy,side
+1101,neck,levator scapulae,left
+1102,neck,levator scapulae,right
+1111,neck,semispinalis cervicis and multifidus,left
+1112,neck,semispinalis cervicis and multifidus,right
+1121,neck,semispinalis capitis,left
+1122,neck,semispinalis capitis,right
+1131,neck,splenius capitis,left
+1132,neck,splenius capitis,right
+1141,neck,sternocleidomastoid,left
+1142,neck,sternocleidomastoid,right
+1151,neck,longus colli,left
+1152,neck,longus colli,right
+1161,neck,trapezius,left
+1162,neck,trapezius,right
+2101,shoulder,supraspinatus,left
+2102,shoulder,supraspinatus,right
+2111,shoulder,subscapularis,left
+2112,shoulder,subscapularis,right
+2121,shoulder,infraspinatus,left
+2122,shoulder,infraspinatus,right
+2141,shoulder,deltoid,left
+2142,shoulder,deltoid,right
+4101,thorax,rhomboid,left
+4102,thorax,rhomboid,right
+5101,abdomen,thoracolumbar multifidus,left
+5102,abdomen,thoracolumbar multifidus,right
+5111,abdomen,erector spinae,left
+5112,abdomen,erector spinae,right
+5121,abdomen,psoas major,left
+5122,abdomen,psoas major,right
+5131,abdomen,quadratus lumborum,left
+5132,abdomen,quadratus lumborum,right
+5141,abdomen,lattisimus dorsi,left
+5142,abdomen,lattisimus dorsi,right
+6101,pelvis,gluteus minimus,left
+6102,pelvis,gluteus minimus,right
+6111,pelvis,gluteus medius,left
+6112,pelvis,gluteus medius,right
+6121,pelvis,gluteus maximus,left
+6122,pelvis,gluteus maximus,right
+6131,pelvis,tensor fascia latae,left
+6132,pelvis,tensor fascia latae,right
+6141,pelvis,iliacus,left
+6142,pelvis,iliacus,right
+6151,pelvis,ilium,left
+6152,pelvis,ilium,right
+6160,pelvis,sacrum,no side
+6171,pelvis,femur,left
+6172,pelvis,femur,right
+6181,pelvis,piriformis,left
+6182,pelvis,piriformis,right
+6191,pelvis,pectineus,left
+6192,pelvis,pectineus,right
+6201,pelvis,obturator internus,left
+6202,pelvis,obturator internus,right
+6211,pelvis,obturator externus,left
+6212,pelvis,obturator externus,right
+6221,pelvis,gemelli and quadratus femoris,left
+6222,pelvis,gemelli and quadratus femoris,right
+7101,thigh,vastus lateralis,left
+7102,thigh,vastus lateralis,right
+7111,thigh,vastus intermedius,left
+7112,thigh,vastus intermedius,right
+7121,thigh,vastus medialis,left
+7122,thigh,vastus medialis,right
+7131,thigh,rectus femoris,left
+7132,thigh,rectus femoris,right
+7141,thigh,sartorius,left
+7142,thigh,sartorius,right
+7151,thigh,gracilis,left
+7152,thigh,gracilis,right
+7161,thigh,semimembranosus,left
+7162,thigh,semimembranosus,right
+7171,thigh,semitendinosus,left
+7172,thigh,semitendinosus,right
+7181,thigh,biceps femoris long head,left
+7182,thigh,biceps femoris long head,right
+7191,thigh,biceps femoris short head,left
+7192,thigh,biceps femoris short head,right
+7201,thigh,adductor magnus,left
+7202,thigh,adductor magnus,right
+7211,thigh,adductor longus,left
+7212,thigh,adductor longus,right
+7221,thigh,adductor brevis,left
+7222,thigh,adductor brevis,right
+8101,leg,anterior compartment,left
+8102,leg,anterior compartment,right
+8111,leg,deep posterior compartment,left
+8112,leg,deep posterior compartment,right
+8121,leg,lateral compartment,left
+8122,leg,lateral compartment,right
+8131,leg,soleus,left
+8132,leg,soleus,right
+8141,leg,gastrocnemius,left
+8142,leg,gastrocnemius,right
+8151,leg,tibia,left
+8152,leg,tibia,right
+8161,leg,fibula,left
+8162,leg,fibula,right

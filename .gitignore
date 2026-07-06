@@ -1,0 +1,20 @@
+# Imaging data (large, potentially sensitive - never commit)
+data/
+
+# External dependency - cloned separately from https://github.com/MuscleMap/MuscleMap
+MuscleMap/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+conversion/.venv/
+
+# Generated run logs / local machine paths
+gui/run_configs/
+
+# Local machine-specific files
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+*.lnk

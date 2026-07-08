@@ -257,6 +257,318 @@ def load_totalseg_abdominal_cavity(
     return np.zeros(reference_shape, dtype=bool)
 
 
+
+def load_totalseg_trunk_cavity_exclusions(
+    base: str,
+    reference_shape,
+    folder_name: str = "TS_TRUNK_CAVITIES",
+    exclude_names=None,
+) -> np.ndarray:
+    """
+    Load TotalSegmentator trunk_cavities masks that should be excluded from fat
+    compartments, especially SAT.
+
+    Important:
+      - abdominal_cavity is intentionally NOT included by default because it is
+        used for VAT/SAT separation.
+      - thoracic_cavity, pericardium/pericardial cavity, and mediastinum are
+        excluded so superficial/trunk SAT does not leak into these cavities.
+    """
+    base = Path(base)
+    folder = base / folder_name
+
+    if exclude_names is None:
+        exclude_names = [
+            "thoracic_cavity",
+            "pericardium",
+            "pericardial_cavity",
+            "mediastinum",
+            "pleural_cavity",
+            "pleural_cavity_left",
+            "pleural_cavity_right",
+        ]
+
+    if not folder.exists():
+        print(f"    NOTE: TotalSeg trunk cavities folder not found for cavity exclusions: {folder}")
+        return np.zeros(reference_shape, dtype=bool)
+
+    combined = np.zeros(reference_shape, dtype=bool)
+    used = []
+
+    for name in exclude_names:
+        candidates = [
+            folder / f"{name}.nii.gz",
+            folder / f"{name}.nii",
+        ]
+        for candidate in candidates:
+            m = _load_binary_nifti_mask(candidate, reference_shape, label=f"TotalSeg trunk cavity exclusion {name}")
+            if np.any(m):
+                combined |= m
+                used.append(candidate.name)
+                break
+
+    if used:
+        print(f"    Excluding TotalSeg trunk cavity masks from fat compartments: {', '.join(used)}")
+    else:
+        print(f"    NOTE: No matching TotalSeg trunk cavity exclusion masks found in {folder}")
+
+    return combined
+
+
+
+
+def load_totalseg_trunk_cavity_masks(
+    base: str,
+    reference_shape,
+    folder_name: str = "TS_TRUNK_CAVITIES",
+) -> dict:
+    """
+    Load the individual TotalSegmentator trunk_cavities masks needed to build
+    thoracic trunk fat compartments.
+
+    Expected masks from trunk_cavities:
+      - thoracic_cavity.nii.gz
+      - pericardium.nii.gz
+      - mediastinum.nii.gz
+
+    Returns a dict of name -> binary mask. Missing/mismatched masks are returned
+    as all-False masks so downstream logic can run safely.
+    """
+    base = Path(base)
+    folder = base / folder_name
+    names = ["thoracic_cavity", "pericardium", "mediastinum"]
+    masks = {}
+
+    if not folder.exists():
+        print(f"    NOTE: TotalSeg trunk cavities folder not found for thoracic fat labels: {folder}")
+        return {name: np.zeros(reference_shape, dtype=bool) for name in names}
+
+    for name in names:
+        mask = np.zeros(reference_shape, dtype=bool)
+        for candidate in [folder / f"{name}.nii.gz", folder / f"{name}.nii"]:
+            m = _load_binary_nifti_mask(candidate, reference_shape, label=f"TotalSeg trunk cavity {name}")
+            if np.any(m):
+                mask = m
+                print(f"    Using TotalSeg trunk cavity mask for thoracic fat labels: {candidate}")
+                break
+        masks[name] = mask
+
+    return masks
+
+
+def _mask_name_matches(name: str, include_terms) -> bool:
+    """Return True when a TotalSegmentator mask name matches any include term."""
+    low = str(name).lower()
+    return any(str(term).lower() in low for term in include_terms)
+
+
+def load_totalseg_named_anatomy_exclusion(
+    base: str,
+    reference_shape,
+    folder_names=None,
+    include_terms=None,
+    eroded_label_filename: str = "TotalSegmentator_nonMuscleMap_labels_eroded1.nii.gz",
+) -> np.ndarray:
+    """
+    Load organ/bone/anatomy masks that should be excluded from thoracic fat labels.
+
+    Preferred behavior:
+      - Use the precomputed eroded TotalSegmentator label map located directly
+        in the station folder: TotalSegmentator_nonMuscleMap_labels_eroded1.nii.gz
+      - Use TotalSegmentator_nonMuscleMap_labels.csv as the lookup table.
+
+    This prevents thoracic trunk fat from counting lung, heart, spine/vertebrae,
+    ribs/sternum, aorta, esophagus, trachea/bronchi, and similar non-fat anatomy,
+    while avoiding over-conservative exclusion from full organ boundaries.
+
+    Fallback behavior:
+      - If the eroded label map is missing, fall back to the full combined label map.
+      - If the combined label map/CSV are missing, fall back to individual masks
+        in TotalSegmentator output folders.
+    """
+    base = Path(base)
+    if folder_names is None:
+        folder_names = ["TS_TOTAL_MR_FULL", "TS_EXTRA_FOR_LABELS"]
+    if include_terms is None:
+        include_terms = [
+            "lung", "heart", "vertebra", "spinal_cord", "rib", "sternum",
+            "aorta", "esophagus", "trachea", "bronch",
+        ]
+
+    # 1) Preferred: use precomputed eroded combined label map in the station folder.
+    # The CSV label table remains the same as the full combined label map.
+    csv_path = base / "TotalSegmentator_nonMuscleMap_labels.csv"
+    preferred_label_paths = [
+        base / eroded_label_filename,
+        base / "TotalSegmentator_nonMuscleMap_labels.nii.gz",
+    ]
+
+    for label_path in preferred_label_paths:
+        if not label_path.exists() or not csv_path.exists():
+            continue
+        try:
+            img = nib.load(str(label_path))
+            labels_img = np.rint(img.get_fdata()).astype(np.int32)
+        except Exception as e:
+            print(f"    NOTE: Could not read thoracic anatomy label map {label_path.name}: {e}")
+            continue
+
+        if labels_img.shape != tuple(reference_shape):
+            print(
+                f"    NOTE: Thoracic anatomy label map shape mismatch; skipped. "
+                f"{label_path.name}={labels_img.shape}, Dixon={tuple(reference_shape)}"
+            )
+            continue
+
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            print(f"    NOTE: Could not read TotalSegmentator label CSV for thoracic exclusions: {e}")
+            continue
+
+        cols = {str(c).strip().lower(): c for c in df.columns}
+        name_col = None
+        id_col = None
+        for candidate in ["name", "label", "structure", "mask_name", "class_name"]:
+            if candidate in cols:
+                name_col = cols[candidate]
+                break
+        for candidate in ["label_id", "id", "label_value", "value"]:
+            if candidate in cols:
+                id_col = cols[candidate]
+                break
+
+        if name_col is None or id_col is None:
+            print("    NOTE: TotalSegmentator label CSV missing name/id columns for thoracic exclusions.")
+            continue
+
+        ids = []
+        matched_names = []
+        for _, row in df.iterrows():
+            try:
+                name = str(row[name_col]).strip().lower()
+                lab = int(row[id_col])
+            except Exception:
+                continue
+            if _mask_name_matches(name, include_terms):
+                ids.append(lab)
+                matched_names.append(name)
+
+        if ids:
+            combined = np.isin(labels_img, ids)
+            if np.any(combined):
+                source_label = "eroded" if label_path.name == eroded_label_filename else "full fallback"
+                preview = ", ".join(matched_names[:12])
+                if len(matched_names) > 12:
+                    preview += f", ... (+{len(matched_names)-12} more)"
+                print(
+                    f"    Excluding thoracic organ/bone anatomy from trunk fat labels "
+                    f"using {source_label} label map {label_path.name}: {preview}"
+                )
+                return combined
+
+    # 2) Last-resort fallback: individual full-resolution masks.
+    combined = np.zeros(reference_shape, dtype=bool)
+    used = []
+
+    for folder_name in folder_names:
+        folder = base / folder_name
+        if not folder.exists():
+            continue
+        for p in sorted(list(folder.glob("*.nii.gz")) + list(folder.glob("*.nii"))):
+            stem = p.name
+            if stem.lower().endswith(".nii.gz"):
+                stem = stem[:-7]
+            elif stem.lower().endswith(".nii"):
+                stem = stem[:-4]
+            if not _mask_name_matches(stem, include_terms):
+                continue
+            m = _load_binary_nifti_mask(p, reference_shape, label=f"thoracic anatomy exclusion {stem}")
+            if np.any(m):
+                combined |= m
+                used.append(f"{folder_name}/{p.name}")
+
+    if used:
+        preview = ", ".join(used[:12])
+        if len(used) > 12:
+            preview += f", ... (+{len(used)-12} more)"
+        print(f"    Excluding thoracic organ/bone anatomy from trunk fat labels using individual full-mask fallback: {preview}")
+    else:
+        print("    NOTE: No thoracic organ/bone anatomy exclusions found for trunk fat labels.")
+    return combined
+
+
+def save_slicer_color_table(out_ctbl: str):
+    """Save a Slicer-compatible color table so label IDs display with names."""
+    lines = [
+        "# Color table file generated by WholeBodySeg",
+        "# Label Name R G B A",
+        "0 Background 0 0 0 0",
+        "1 PericardialFat 95 190 95 255",
+        "2 MediastinalFat 245 210 120 255",
+        "3 NonSpecificTrunkFat 230 150 120 255",
+    ]
+    with open(out_ctbl, "w", newline="") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def build_thoracic_trunk_fat_labels(
+    signal: np.ndarray,
+    ff: np.ndarray,
+    thoracic_cavity: np.ndarray,
+    pericardium: np.ndarray,
+    mediastinum: np.ndarray,
+    muscle_exclusion: np.ndarray,
+    anatomy_exclusion: np.ndarray = None,
+    fat_ff_threshold: float = 0.3,
+) -> np.ndarray:
+    """
+    Build one mutually exclusive multi-label thoracic trunk fat segmentation.
+
+    Label values:
+      0 = background
+      1 = PericardialFat
+      2 = MediastinalFat
+      3 = NonSpecificTrunkFat
+
+    NonSpecificTrunkFat is fat inside thoracic_cavity that is not already
+    assigned to pericardial or mediastinal fat.
+    """
+    if anatomy_exclusion is None:
+        anatomy_exclusion = np.zeros(signal.shape, dtype=bool)
+
+    candidate = (
+        signal.astype(bool)
+        & np.isfinite(ff)
+        & (ff >= float(fat_ff_threshold))
+        & (~muscle_exclusion.astype(bool))
+        & (~anatomy_exclusion.astype(bool))
+    )
+
+    thoracic_cavity = thoracic_cavity.astype(bool)
+    pericardium = pericardium.astype(bool)
+    mediastinum = mediastinum.astype(bool)
+
+    # Hierarchical, mutually exclusive assignment.
+    pericardial_fat = candidate & pericardium
+    mediastinal_fat = candidate & mediastinum & (~pericardial_fat)
+    nonspecific_trunk_fat = candidate & thoracic_cavity & (~pericardium) & (~mediastinum)
+
+    labels = np.zeros(signal.shape, dtype=np.uint8)
+    labels[pericardial_fat] = 1
+    labels[mediastinal_fat] = 2
+    labels[nonspecific_trunk_fat] = 3
+    return labels
+
+
+def save_thoracic_trunk_fat_label_csv(out_csv: str):
+    rows = [
+        {"LabelID": 1, "Name": "PericardialFat", "Description": "Fat-fraction-positive voxels inside TotalSegmentator pericardium, excluding eroded organ/bone anatomy", "R": 95, "G": 190, "B": 95, "A": 255},
+        {"LabelID": 2, "Name": "MediastinalFat", "Description": "Fat-fraction-positive voxels inside TotalSegmentator mediastinum, excluding eroded organ/bone anatomy", "R": 245, "G": 210, "B": 120, "A": 255},
+        {"LabelID": 3, "Name": "NonSpecificTrunkFat", "Description": "Remaining fat-fraction-positive voxels inside thoracic cavity outside pericardium and mediastinum, excluding eroded organ/bone anatomy", "R": 230, "G": 150, "B": 120, "A": 255},
+    ]
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
+
 def load_totalseg_torso_fat(
     base: str,
     reference_shape,
@@ -565,7 +877,11 @@ def build_sat_imat_masks(
     use_totalseg_subcutaneous_fat_for_sat: bool = True,
     totalseg_tissue_types_mr_folder: str = "TS_TISSUE_TYPES_MR",
     torso_fat_mask_out: str = None,
-    subcutaneous_fat_mask_out: str = None
+    subcutaneous_fat_mask_out: str = None,
+    trunk_cavity_exclusion_mask_out: str = None,
+    thoracic_trunk_fat_labels_out: str = None,
+    thoracic_trunk_fat_labels_csv_out: str = None,
+    thoracic_trunk_fat_labels_ctbl_out: str = None
 ):
     w_img = nib.load(water_path)
     f_img = nib.load(fat_path)
@@ -588,8 +904,6 @@ def build_sat_imat_masks(
     if use_totalseg_exclusions:
         ts_anatomy = load_total_segmentator_mask(base_dir or os.path.dirname(ff_path), signal.shape)
 
-    exclusion = ts_anatomy
-
     # Block cavity/VAT at and above the lungs so the abdominal cavity mask does
     # not extend into the thorax. This does not affect SAT/IMAT directly.
     lung_block = np.zeros_like(signal, dtype=bool)
@@ -601,12 +915,42 @@ def build_sat_imat_masks(
         )
 
     direct_abdominal_cavity = np.zeros_like(signal, dtype=bool)
+    trunk_cavity_exclusion = np.zeros_like(signal, dtype=bool)
     if use_totalseg_exclusions and use_totalseg_abdominal_cavity:
         direct_abdominal_cavity = load_totalseg_abdominal_cavity(
             base_dir or os.path.dirname(ff_path),
             signal.shape,
             folder_name=totalseg_trunk_cavities_folder,
         )
+        trunk_cavity_exclusion = load_totalseg_trunk_cavity_exclusions(
+            base_dir or os.path.dirname(ff_path),
+            signal.shape,
+            folder_name=totalseg_trunk_cavities_folder,
+        )
+
+    trunk_cavity_masks = {
+        "thoracic_cavity": np.zeros_like(signal, dtype=bool),
+        "pericardium": np.zeros_like(signal, dtype=bool),
+        "mediastinum": np.zeros_like(signal, dtype=bool),
+    }
+    thoracic_anatomy_exclusion = np.zeros_like(signal, dtype=bool)
+    if use_totalseg_exclusions:
+        trunk_cavity_masks = load_totalseg_trunk_cavity_masks(
+            base_dir or os.path.dirname(ff_path),
+            signal.shape,
+            folder_name=totalseg_trunk_cavities_folder,
+        )
+        thoracic_anatomy_exclusion = load_totalseg_named_anatomy_exclusion(
+            base_dir or os.path.dirname(ff_path),
+            signal.shape,
+        )
+
+    thoracic_trunk_fat_labels = np.zeros_like(signal, dtype=np.uint8)
+
+    # Exclude standard TotalSeg anatomy plus selected trunk cavity masks from
+    # fat candidates. The abdominal cavity itself remains available for VAT logic;
+    # thoracic/pericardial/mediastinal spaces are blocked from SAT/IMAT/VAT.
+    exclusion = ts_anatomy | trunk_cavity_exclusion
 
     abdominal_muscle_mask = np.zeros_like(signal, dtype=bool)
     if use_totalseg_exclusions and use_totalseg_abdominal_muscles:
@@ -783,6 +1127,38 @@ def build_sat_imat_masks(
         sat_mask = subcutaneous_fat_direct & signal & fat_candidate_sat & (~muscle_exclusion_for_fat) & (~vat_mask)
         imat_mask = imat_mask & (~sat_mask) & (~vat_mask)
 
+    # Build a mutually exclusive thoracic trunk fat label map from the explicit
+    # TotalSegmentator trunk_cavities outputs. These labels are intentionally
+    # separate from SAT/VAT/IMAT.
+    muscle_exclusion_for_thoracic_fat = muscle_mask_eroded | abdominal_muscle_mask
+    if use_totalseg_exclusions and np.any(trunk_cavity_masks.get("thoracic_cavity", False)):
+        thoracic_trunk_fat_labels = build_thoracic_trunk_fat_labels(
+            signal=signal,
+            ff=ff,
+            thoracic_cavity=trunk_cavity_masks.get("thoracic_cavity"),
+            pericardium=trunk_cavity_masks.get("pericardium"),
+            mediastinum=trunk_cavity_masks.get("mediastinum"),
+            muscle_exclusion=muscle_exclusion_for_thoracic_fat,
+            anatomy_exclusion=thoracic_anatomy_exclusion,
+            fat_ff_threshold=fat_ff_threshold_sat,
+        )
+
+    thoracic_trunk_fat_any = thoracic_trunk_fat_labels > 0
+
+    # Final safety: never allow SAT/IMAT/VAT to include selected trunk cavity masks
+    # or the newly assigned thoracic trunk fat labels. This is especially important
+    # when using direct TotalSeg tissue_types_mr subcutaneous_fat as SAT, because it
+    # can occasionally include thoracic or mediastinal cavity voxels.
+    if use_totalseg_exclusions and np.any(trunk_cavity_exclusion):
+        sat_mask = sat_mask & (~trunk_cavity_exclusion)
+        imat_mask = imat_mask & (~trunk_cavity_exclusion)
+        vat_mask = vat_mask & (~trunk_cavity_exclusion)
+
+    if use_totalseg_exclusions and np.any(thoracic_trunk_fat_any):
+        sat_mask = sat_mask & (~thoracic_trunk_fat_any)
+        imat_mask = imat_mask & (~thoracic_trunk_fat_any)
+        vat_mask = vat_mask & (~thoracic_trunk_fat_any)
+
     save_like(ff_img, sat_mask, sat_mask_out, dtype=np.uint8)
     save_like(ff_img, imat_mask, imat_mask_out, dtype=np.uint8)
 
@@ -801,11 +1177,45 @@ def build_sat_imat_masks(
     if subcutaneous_fat_mask_out:
         save_like(ff_img, subcutaneous_fat_direct, subcutaneous_fat_mask_out, dtype=np.uint8)
 
+    if trunk_cavity_exclusion_mask_out:
+        save_like(ff_img, trunk_cavity_exclusion, trunk_cavity_exclusion_mask_out, dtype=np.uint8)
+
+    if thoracic_trunk_fat_labels_out:
+        save_like(ff_img, thoracic_trunk_fat_labels, thoracic_trunk_fat_labels_out, dtype=np.uint8)
+
+    if thoracic_trunk_fat_labels_csv_out:
+        save_thoracic_trunk_fat_label_csv(thoracic_trunk_fat_labels_csv_out)
+
+    if thoracic_trunk_fat_labels_ctbl_out:
+        save_slicer_color_table(thoracic_trunk_fat_labels_ctbl_out)
+
     if eroded_seg_out:
         save_like(seg_img, seg_eroded, eroded_seg_out, dtype=np.int16)
 
 
+def _empty_stats():
+    """Stats placeholder for slices/compartments with zero valid voxels."""
+    return {
+        "mean": np.nan,
+        "median": np.nan,
+        "std": np.nan,
+        "min": np.nan,
+        "max": np.nan,
+    }
+
+
 def compute_binary_mask_metrics(mask_path, ff_map_path, subject, day, compartment_name, out_dir):
+    """
+    Compute volume and per-slice metrics for a binary compartment mask.
+
+    Important behavior:
+      - The volume CSV contains the total compartment volume/statistics.
+      - The slice CSV now writes one row for EVERY Dixon slice, even when the
+        compartment is absent on that slice. Empty slices get n_voxels=0,
+        CSA_cm2=0, and NaN statistics.
+
+    This makes SAT/VAT/IMAT slice CSVs directly comparable by slice_index.
+    """
     mask_img = nib.load(mask_path)
     ff_img = nib.load(ff_map_path)
 
@@ -828,25 +1238,33 @@ def compute_binary_mask_metrics(mask_path, ff_map_path, subject, day, compartmen
             "volume_ml": int(vals.size) * voxel_vol_ml,
             **stats
         })
+    else:
+        vol_rows.append({
+            "compartment": compartment_name,
+            "n_voxels": 0,
+            "volume_ml": 0.0,
+            **_empty_stats()
+        })
 
     slice_rows = []
     zdim = mask.shape[2]
     for z in range(zdim):
         sl_mask = mask[:, :, z]
-        if not np.any(sl_mask):
-            continue
+        vals_z = ff[:, :, z][sl_mask]
+        vals_z = vals_z[np.isfinite(vals_z)]
 
-        vals = ff[:, :, z][sl_mask]
-        vals = vals[np.isfinite(vals)]
-        if vals.size == 0:
-            continue
+        if vals_z.size > 0:
+            stats = summarize(vals_z)
+            n_vox = int(vals_z.size)
+        else:
+            stats = _empty_stats()
+            n_vox = 0
 
-        stats = summarize(vals)
         slice_rows.append({
             "slice_index": int(z),
             "compartment": compartment_name,
-            "n_voxels": int(vals.size),
-            "CSA_cm2": int(vals.size) * pixel_area_cm2,
+            "n_voxels": n_vox,
+            "CSA_cm2": n_vox * pixel_area_cm2,
             **stats
         })
 
@@ -861,6 +1279,200 @@ def compute_binary_mask_metrics(mask_path, ff_map_path, subject, day, compartmen
         index=False
     )
 
+
+def compute_fat_compartment_slice_comparison(mask_paths: dict, ff_map_path, subject, day, out_dir):
+    """
+    Create one wide per-slice CSV for direct compartment comparison.
+
+    Output columns include, for each compartment:
+      <Compartment>_n_voxels
+      <Compartment>_CSA_cm2
+      <Compartment>_mean
+      <Compartment>_median
+      <Compartment>_std
+      <Compartment>_min
+      <Compartment>_max
+
+    This is intended for direct VAT-vs-SAT comparisons on identical Dixon slices.
+    """
+    ff_img = nib.load(ff_map_path)
+    ff = ff_img.get_fdata()
+
+    dx, dy, dz = nib.affines.voxel_sizes(ff_img.affine)
+    pixel_area_cm2 = float(dx * dy) / 100.0
+
+    masks = {}
+    for compartment_name, mask_path in mask_paths.items():
+        mask_img = nib.load(mask_path)
+        mask = mask_img.get_fdata() > 0
+        if mask.shape != ff.shape:
+            raise ValueError(
+                f"Mask shape mismatch for {compartment_name}: "
+                f"mask={mask.shape}, FF={ff.shape}"
+            )
+        masks[compartment_name] = mask
+
+    rows = []
+    for z in range(ff.shape[2]):
+        row = {"slice_index": int(z)}
+        for compartment_name, mask in masks.items():
+            sl_mask = mask[:, :, z]
+            vals_z = ff[:, :, z][sl_mask]
+            vals_z = vals_z[np.isfinite(vals_z)]
+
+            if vals_z.size > 0:
+                stats = summarize(vals_z)
+                n_vox = int(vals_z.size)
+            else:
+                stats = _empty_stats()
+                n_vox = 0
+
+            prefix = str(compartment_name)
+            row[f"{prefix}_n_voxels"] = n_vox
+            row[f"{prefix}_CSA_cm2"] = n_vox * pixel_area_cm2
+            for stat_name, stat_value in stats.items():
+                row[f"{prefix}_{stat_name}"] = stat_value
+
+        rows.append(row)
+
+    tag = f"{subject}_{day}" if day else subject
+    out_path = os.path.join(out_dir, f"{tag}_fat_compartment_slice_comparison.csv")
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    print(f"    saved: {out_path}")
+
+
+
+def compute_fat_compartment_vat_slice_volume_comparison(mask_paths: dict, ff_map_path, subject, day, out_dir):
+    """
+    Create one summary CSV comparing SAT, IMAT, and VAT volumes using ONLY the
+    Dixon slices where VAT is present.
+
+    This is useful when SAT and VAT need to be compared across the exact same
+    anatomical z-range. The slice range is defined by VAT_mask > 0 on a slice.
+    """
+    ff_img = nib.load(ff_map_path)
+    ff = ff_img.get_fdata()
+
+    dx, dy, dz = nib.affines.voxel_sizes(ff_img.affine)
+    voxel_vol_ml = float(dx * dy * dz) / 1000.0
+
+    masks = {}
+    for compartment_name, mask_path in mask_paths.items():
+        mask_img = nib.load(mask_path)
+        mask = mask_img.get_fdata() > 0
+        if mask.shape != ff.shape:
+            raise ValueError(
+                f"Mask shape mismatch for {compartment_name}: "
+                f"mask={mask.shape}, FF={ff.shape}"
+            )
+        masks[compartment_name] = mask
+
+    if "VAT" not in masks:
+        raise ValueError("VAT mask is required to define VAT-containing slices.")
+
+    vat_by_slice = np.any(masks["VAT"], axis=(0, 1))
+    vat_slice_indices = np.where(vat_by_slice)[0].astype(int).tolist()
+
+    rows = []
+    for compartment_name, mask in masks.items():
+        restricted_mask = mask.copy()
+        if vat_by_slice.size != restricted_mask.shape[2]:
+            raise ValueError("VAT slice vector length does not match mask z-dimension.")
+
+        # Keep only slices where VAT exists.
+        restricted_mask[:, :, ~vat_by_slice] = False
+
+        vals = ff[restricted_mask]
+        vals = vals[np.isfinite(vals)]
+
+        if vals.size > 0:
+            stats = summarize(vals)
+            n_vox = int(vals.size)
+        else:
+            stats = _empty_stats()
+            n_vox = 0
+
+        rows.append({
+            "restriction": "slices_with_VAT",
+            "compartment": compartment_name,
+            "vat_slice_count": int(len(vat_slice_indices)),
+            "vat_slice_indices": ";".join(str(x) for x in vat_slice_indices),
+            "n_voxels": n_vox,
+            "volume_ml": n_vox * voxel_vol_ml,
+            **stats,
+        })
+
+    tag = f"{subject}_{day}" if day else subject
+    out_path = os.path.join(out_dir, f"{tag}_fat_compartment_volume_in_VAT_slices.csv")
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    print(f"    saved: {out_path}")
+
+def compute_label_map_metrics(label_map_path, label_csv_path, ff_map_path, subject, day, out_dir):
+    """Compute volume/slice metrics for every nonzero label in a multi-label map."""
+    label_img = nib.load(label_map_path)
+    ff_img = nib.load(ff_map_path)
+
+    labels = np.rint(label_img.get_fdata()).astype(np.int32)
+    ff = ff_img.get_fdata()
+
+    dx, dy, dz = nib.affines.voxel_sizes(ff_img.affine)
+    pixel_area_cm2 = float(dx * dy) / 100.0
+    voxel_vol_ml = float(dx * dy * dz) / 1000.0
+
+    lookup = pd.read_csv(label_csv_path)
+    id_col = "LabelID" if "LabelID" in lookup.columns else lookup.columns[0]
+    name_col = "Name" if "Name" in lookup.columns else lookup.columns[1]
+
+    tag = f"{subject}_{day}" if day else subject
+
+    for _, row in lookup.iterrows():
+        label_id = int(row[id_col])
+        compartment_name = str(row[name_col])
+        mask = labels == label_id
+
+        vals = ff[mask]
+        vals = vals[np.isfinite(vals)]
+
+        vol_rows = []
+        if vals.size > 0:
+            stats = summarize(vals)
+            vol_rows.append({
+                "compartment": compartment_name,
+                "label_id": label_id,
+                "n_voxels": int(vals.size),
+                "volume_ml": int(vals.size) * voxel_vol_ml,
+                **stats,
+            })
+
+        slice_rows = []
+        for z in range(labels.shape[2]):
+            sl_mask = mask[:, :, z]
+            if not np.any(sl_mask):
+                continue
+
+            vals_z = ff[:, :, z][sl_mask]
+            vals_z = vals_z[np.isfinite(vals_z)]
+            if vals_z.size == 0:
+                continue
+
+            stats = summarize(vals_z)
+            slice_rows.append({
+                "slice_index": int(z),
+                "compartment": compartment_name,
+                "label_id": label_id,
+                "n_voxels": int(vals_z.size),
+                "CSA_cm2": int(vals_z.size) * pixel_area_cm2,
+                **stats,
+            })
+
+        pd.DataFrame(vol_rows).to_csv(
+            os.path.join(out_dir, f"{tag}_{compartment_name}_volume.csv"),
+            index=False,
+        )
+        pd.DataFrame(slice_rows).to_csv(
+            os.path.join(out_dir, f"{tag}_{compartment_name}_slice.csv"),
+            index=False,
+        )
 
 def main():
     ap = argparse.ArgumentParser(description="WholeBodySeg SAT/IMAT fat compartment module.")
@@ -895,6 +1507,11 @@ def main():
     qc_dir = os.path.join(base, "eroded_mask_for_qc")
     os.makedirs(qc_dir, exist_ok=True)
 
+    # Keep all CSV outputs from this module together so QC masks and tabular
+    # analysis outputs are not mixed in the station folder.
+    csv_dir = os.path.join(base, "fat compartment csvs")
+    os.makedirs(csv_dir, exist_ok=True)
+
     eroded_seg_path = os.path.join(qc_dir, "Dixon_W_COMP_eroded_dseg.nii.gz")
     sat_mask_path = os.path.join(qc_dir, "SAT_mask.nii.gz")
     imat_mask_path = os.path.join(qc_dir, "IMAT_mask.nii.gz")
@@ -903,8 +1520,12 @@ def main():
     abdominal_muscles_mask_path = os.path.join(qc_dir, "Abdominal_muscles_mask.nii.gz")
     torso_fat_mask_path = os.path.join(qc_dir, "TS_torso_fat_for_VAT_mask.nii.gz")
     subcutaneous_fat_mask_path = os.path.join(qc_dir, "TS_subcutaneous_fat_for_SAT_mask.nii.gz")
+    trunk_cavity_exclusion_mask_path = os.path.join(qc_dir, "TS_trunk_cavity_exclusion_mask.nii.gz")
+    thoracic_trunk_fat_labels_path = os.path.join(qc_dir, "Thoracic_trunk_fat_labels.nii.gz")
+    thoracic_trunk_fat_labels_csv_path = os.path.join(qc_dir, "Thoracic_trunk_fat_labels.csv")
+    thoracic_trunk_fat_labels_ctbl_path = os.path.join(qc_dir, "Thoracic_trunk_fat_labels.ctbl")
 
-    print("Building SAT, IMAT, VAT, and abdominal cavity QC masks")
+    print("Building SAT, IMAT, VAT, abdominal cavity, and thoracic trunk fat QC masks")
     build_sat_imat_masks(
         water_path=w_path,
         fat_path=f_path,
@@ -937,17 +1558,57 @@ def main():
         use_totalseg_subcutaneous_fat_for_sat=not args.disable_totalseg_subcutaneous_fat_for_sat,
         totalseg_tissue_types_mr_folder=args.totalseg_tissue_types_mr_folder,
         torso_fat_mask_out=torso_fat_mask_path,
-        subcutaneous_fat_mask_out=subcutaneous_fat_mask_path
+        subcutaneous_fat_mask_out=subcutaneous_fat_mask_path,
+        trunk_cavity_exclusion_mask_out=trunk_cavity_exclusion_mask_path,
+        thoracic_trunk_fat_labels_out=thoracic_trunk_fat_labels_path,
+        thoracic_trunk_fat_labels_csv_out=thoracic_trunk_fat_labels_csv_path,
+        thoracic_trunk_fat_labels_ctbl_out=thoracic_trunk_fat_labels_ctbl_path
     )
 
     print("Computing SAT metrics")
-    compute_binary_mask_metrics(sat_mask_path, ff_path, args.subject, args.day, "SAT", base)
+    compute_binary_mask_metrics(sat_mask_path, ff_path, args.subject, args.day, "SAT", csv_dir)
 
     print("Computing IMAT metrics")
-    compute_binary_mask_metrics(imat_mask_path, ff_path, args.subject, args.day, "IMAT", base)
+    compute_binary_mask_metrics(imat_mask_path, ff_path, args.subject, args.day, "IMAT", csv_dir)
 
     print("Computing VAT metrics")
-    compute_binary_mask_metrics(vat_mask_path, ff_path, args.subject, args.day, "VAT", base)
+    compute_binary_mask_metrics(vat_mask_path, ff_path, args.subject, args.day, "VAT", csv_dir)
+
+    print("Computing fat compartment slice comparison")
+    compute_fat_compartment_slice_comparison(
+        {
+            "SAT": sat_mask_path,
+            "IMAT": imat_mask_path,
+            "VAT": vat_mask_path,
+        },
+        ff_path,
+        args.subject,
+        args.day,
+        csv_dir,
+    )
+
+    print("Computing fat compartment volumes restricted to VAT-containing slices")
+    compute_fat_compartment_vat_slice_volume_comparison(
+        {
+            "SAT": sat_mask_path,
+            "IMAT": imat_mask_path,
+            "VAT": vat_mask_path,
+        },
+        ff_path,
+        args.subject,
+        args.day,
+        csv_dir,
+    )
+
+    print("Computing thoracic trunk fat metrics")
+    compute_label_map_metrics(
+        thoracic_trunk_fat_labels_path,
+        thoracic_trunk_fat_labels_csv_path,
+        ff_path,
+        args.subject,
+        args.day,
+        csv_dir,
+    )
 
     print("Fat compartment module DONE")
 

@@ -845,6 +845,38 @@ def smooth_and_extend_cavity_mask_3d(
 
     return cavity
 
+
+def grow_seeded_mask_inplane(
+    seed_mask: np.ndarray,
+    allowed_mask: np.ndarray,
+    max_iterations: int = 5,
+) -> np.ndarray:
+    """
+    Recover nearby allowed voxels from a trusted seed without permitting unlimited
+    connected-component growth.
+
+    Growth is restricted to the axial plane (3x3x1), which prevents a small seed
+    from propagating long distances superiorly/inferiorly through loosely connected
+    fat. The returned mask is always a subset of ``allowed_mask``.
+    """
+    seed = seed_mask.astype(bool) & allowed_mask.astype(bool)
+    allowed = allowed_mask.astype(bool)
+
+    if not np.any(seed):
+        return np.zeros_like(allowed, dtype=bool)
+
+    grown = seed.copy()
+    structure = np.ones((3, 3, 1), dtype=bool)
+
+    for _ in range(max(0, int(max_iterations))):
+        expanded = ndi.binary_dilation(grown, structure=structure)
+        updated = expanded & allowed
+        if np.array_equal(updated, grown):
+            break
+        grown = updated
+
+    return grown
+
 def build_sat_imat_masks(
     water_path: str,
     fat_path: str,
@@ -881,7 +913,10 @@ def build_sat_imat_masks(
     trunk_cavity_exclusion_mask_out: str = None,
     thoracic_trunk_fat_labels_out: str = None,
     thoracic_trunk_fat_labels_csv_out: str = None,
-    thoracic_trunk_fat_labels_ctbl_out: str = None
+    thoracic_trunk_fat_labels_ctbl_out: str = None,
+    pericardial_fat_mask_out: str = None,
+    station_name: str = "",
+    upper_imat_dilate_voxels: int = 1
 ):
     w_img = nib.load(water_path)
     f_img = nib.load(fat_path)
@@ -1100,32 +1135,108 @@ def build_sat_imat_masks(
             max_superior_extend_slices=abdominal_cavity_thoracic_extension_slices,
         )
 
-    if use_totalseg_exclusions and use_totalseg_torso_fat_for_vat and np.any(torso_fat_direct):
-        # Prefer TotalSegmentator tissue_types_mr/torso_fat as VAT.
-        # Restrict to signal and fat-fraction threshold to avoid non-fat tissue leakage.
-        muscle_exclusion_for_fat = muscle_mask_eroded | abdominal_muscle_mask
-        vat_mask = torso_fat_direct & signal & fat_candidate_vat & (~muscle_exclusion_for_fat)
+    # -------------------------------------------------------------------------
+    # Compartment-first classification with seeded VAT recovery
+    # -------------------------------------------------------------------------
+    # The TotalSegmentator torso_fat mask is used as a trusted VAT seed rather than
+    # as the final VAT result. Nearby Dixon-positive fat may be recovered only when
+    # it lies inside the abdominal cavity and can be reached from that seed within a
+    # limited number of in-plane growth steps while preserving the trusted torso_fat core. This avoids accepting every fatty
+    # voxel in an imperfect abdominal-cavity mask (for example posterior spinal or
+    # paraspinal extensions), while recovering small VAT regions missed by
+    # tissue_types_mr.
+    station_is_upper = str(station_name).strip().lower() == "upper"
+    muscle_exclusion_for_fat = muscle_mask_eroded | abdominal_muscle_mask
 
-        # Remove any directly identified torso fat from SAT/IMAT. This replaces the
-        # older abdominal-cavity carving approach when torso_fat is available.
-        sat_mask = sat_pre_cavity_carve & (~vat_mask)
-        imat_mask = imat_pre_cavity_carve & (~vat_mask)
+    # Preserve the trusted torso_fat result as the VAT core. The abdominal cavity
+    # is used only to recover additional nearby VAT; it is not allowed to delete
+    # core torso_fat voxels when the cavity mask is locally incomplete.
+    vat_core = (
+        torso_fat_direct
+        & fat_candidate_vat
+        & (~muscle_exclusion_for_fat)
+    )
 
-    elif use_totalseg_exclusions and (np.any(cavity_mask) or np.any(direct_abdominal_cavity)):
-        # Re-carve VAT from the pre-cavity SAT mask using the best available cavity.
-        # This removes SAT bleed-over in internal trunk slices.
-        muscle_exclusion_for_fat = muscle_mask_eroded | abdominal_muscle_mask
-        vat_mask = sat_pre_cavity_carve & cavity_mask & fat_candidate_vat & (~muscle_exclusion_for_fat)
-        sat_mask = sat_pre_cavity_carve & (~vat_mask)
-        imat_mask = imat_pre_cavity_carve & (~vat_mask)
+    vat_recovery_allowed = (
+        fat_candidate_vat
+        & cavity_mask
+        & (~muscle_exclusion_for_fat)
+    )
 
+    if (
+        use_totalseg_exclusions
+        and use_totalseg_torso_fat_for_vat
+        and np.any(vat_core)
+    ):
+        # Include vat_core in the allowed domain so trusted seed voxels are retained
+        # even when they fall just outside an imperfect abdominal-cavity mask.
+        vat_growth_domain = vat_recovery_allowed | vat_core
+
+        vat_recovered = grow_seeded_mask_inplane(
+            seed_mask=vat_core,
+            allowed_mask=vat_growth_domain,
+            max_iterations=10,
+        )
+        vat_mask = vat_core | vat_recovered
+
+        print(
+            "    Upper/trunk VAT logic: preserved torso_fat core plus cavity-constrained "
+            "Dixon VAT recovery (maximum 10 in-plane voxels)."
+        )
+    elif use_totalseg_exclusions and np.any(vat_recovery_allowed):
+        # Conservative fallback when torso_fat is unavailable: retain the earlier
+        # cavity-carved VAT rather than classifying all cavity fat as VAT.
+        vat_mask = vat_mask & vat_recovery_allowed
+        print(
+            "    NOTE: torso_fat VAT core unavailable; using conservative "
+            "cavity-carved VAT fallback."
+        )
+    else:
+        vat_mask = np.zeros_like(fat_candidate_vat, dtype=bool)
+
+    # SAT remains driven by the direct subcutaneous-fat mask when available;
+    # otherwise retain the existing fascia/body-shell result. VAT has priority for
+    # any accidental overlap inside the abdominal cavity.
     if use_totalseg_exclusions and use_totalseg_subcutaneous_fat_for_sat and np.any(subcutaneous_fat_direct):
-        # Prefer TotalSegmentator tissue_types_mr/subcutaneous_fat as SAT.
-        # Keep the FF threshold and muscle/VAT exclusions so the saved SAT mask is
-        # conservative and non-overlapping with VAT/IMAT.
-        muscle_exclusion_for_fat = muscle_mask_eroded | abdominal_muscle_mask
-        sat_mask = subcutaneous_fat_direct & signal & fat_candidate_sat & (~muscle_exclusion_for_fat) & (~vat_mask)
-        imat_mask = imat_mask & (~sat_mask) & (~vat_mask)
+        sat_mask = (
+            subcutaneous_fat_direct
+            & signal
+            & fat_candidate_sat
+            & (~muscle_exclusion_for_fat)
+            & (~vat_mask)
+        )
+    else:
+        sat_mask = sat_pre_cavity_carve & (~vat_mask)
+
+    if station_is_upper:
+        # Upper-station IMAT is restricted to a tight skeletal-muscle neighborhood.
+        # This prevents residual intra-abdominal fat from being classified as IMAT.
+        # The full (non-eroded) muscle labels provide the anatomical support, while
+        # the eroded muscle core is excluded so the mask remains a fat compartment.
+        upper_muscle_support = (seg > 0) | abdominal_muscle_mask
+        dilate_iter = max(0, int(upper_imat_dilate_voxels))
+        if dilate_iter > 0:
+            upper_muscle_support = ndi.binary_dilation(
+                upper_muscle_support,
+                structure=np.ones((3, 3, 1), dtype=bool),
+                iterations=dilate_iter,
+            )
+
+        imat_mask = (
+            fat_candidate_imat
+            & upper_muscle_support
+            & (~muscle_mask_eroded)
+            & (~vat_mask)
+            & (~sat_mask)
+        )
+        print(
+            f"    Upper-station compartment-first logic: cavity-defined VAT; "
+            f"IMAT restricted to muscle support (dilation={dilate_iter} voxel(s))."
+        )
+    else:
+        # Preserve the validated lower-body fascia-based IMAT behavior.
+        imat_mask = imat_pre_cavity_carve & (~vat_mask) & (~sat_mask)
+        print("    Lower-station logic: preserving fascia-based IMAT classification.")
 
     # Build a mutually exclusive thoracic trunk fat label map from the explicit
     # TotalSegmentator trunk_cavities outputs. These labels are intentionally
@@ -1188,6 +1299,13 @@ def build_sat_imat_masks(
 
     if thoracic_trunk_fat_labels_ctbl_out:
         save_slicer_color_table(thoracic_trunk_fat_labels_ctbl_out)
+
+    # Export pericardial fat as a standalone binary compartment in addition to the
+    # combined thoracic multi-label image. In Thoracic_trunk_fat_labels.nii.gz,
+    # label value 1 is PericardialFat.
+    if pericardial_fat_mask_out:
+        pericardial_fat_mask = thoracic_trunk_fat_labels == 1
+        save_like(ff_img, pericardial_fat_mask, pericardial_fat_mask_out, dtype=np.uint8)
 
     if eroded_seg_out:
         save_like(seg_img, seg_eroded, eroded_seg_out, dtype=np.int16)
@@ -1498,6 +1616,8 @@ def main():
     ap.add_argument("--disable_totalseg_abdominal_muscles", action="store_true")
     ap.add_argument("--disable_cavity_smooth_3d", action="store_true")
     ap.add_argument("--disable_totalseg_exclusions", action="store_true")
+    ap.add_argument("--station", default="", help="Station name, typically Upper or Lower")
+    ap.add_argument("--upper_imat_dilate_voxels", type=int, default=1)
     args = ap.parse_args()
 
     base = args.dir
@@ -1524,6 +1644,7 @@ def main():
     thoracic_trunk_fat_labels_path = os.path.join(qc_dir, "Thoracic_trunk_fat_labels.nii.gz")
     thoracic_trunk_fat_labels_csv_path = os.path.join(qc_dir, "Thoracic_trunk_fat_labels.csv")
     thoracic_trunk_fat_labels_ctbl_path = os.path.join(qc_dir, "Thoracic_trunk_fat_labels.ctbl")
+    pericardial_fat_mask_path = os.path.join(qc_dir, "PericardialFat_mask.nii.gz")
 
     print("Building SAT, IMAT, VAT, abdominal cavity, and thoracic trunk fat QC masks")
     build_sat_imat_masks(
@@ -1562,7 +1683,10 @@ def main():
         trunk_cavity_exclusion_mask_out=trunk_cavity_exclusion_mask_path,
         thoracic_trunk_fat_labels_out=thoracic_trunk_fat_labels_path,
         thoracic_trunk_fat_labels_csv_out=thoracic_trunk_fat_labels_csv_path,
-        thoracic_trunk_fat_labels_ctbl_out=thoracic_trunk_fat_labels_ctbl_path
+        thoracic_trunk_fat_labels_ctbl_out=thoracic_trunk_fat_labels_ctbl_path,
+        pericardial_fat_mask_out=pericardial_fat_mask_path,
+        station_name=args.station,
+        upper_imat_dilate_voxels=args.upper_imat_dilate_voxels
     )
 
     print("Computing SAT metrics")
@@ -1610,6 +1734,16 @@ def main():
         csv_dir,
     )
 
+    print("Computing standalone pericardial fat metrics")
+    compute_binary_mask_metrics(
+        pericardial_fat_mask_path,
+        ff_path,
+        args.subject,
+        args.day,
+        "PericardialFat",
+        csv_dir,
+    )
+
     print("Fat compartment module DONE")
 
 
@@ -1638,6 +1772,8 @@ def run_fat_compartments(station_dir, cfg):
         "--totalseg_tissue_types_mr_folder", str(cfg.get("totalseg_tissue_types_mr_folder", "TS_TISSUE_TYPES_MR")),
         "--abdominal_wall_dilate_size", str(cfg.get("abdominal_wall_dilate_size", 5)),
         "--abdominal_wall_close_size", str(cfg.get("abdominal_wall_close_size", 7)),
+        "--station", station_dir.name,
+        "--upper_imat_dilate_voxels", str(cfg.get("upper_imat_dilate_voxels", 1)),
     ]
 
     if not cfg.get("use_totalseg_abdominal_cavity", True):

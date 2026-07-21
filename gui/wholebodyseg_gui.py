@@ -46,6 +46,16 @@ STAGE_FLAGS = [
     ("run_summary", "Build WholeBodySeg summary CSVs", 0),
 ]
 
+FAT_COMPARTMENT_MODE_OPTIONS = {
+    "Build + Metrics": "build_and_metrics",
+    "Build Only": "build",
+    "Metrics Only (QC Re-export)": "metrics",
+}
+FAT_COMPARTMENT_MODE_LABELS = {
+    value: label for label, value in FAT_COMPARTMENT_MODE_OPTIONS.items()
+}
+DEFAULT_FAT_COMPARTMENT_MODE = "build_and_metrics"
+
 # Log lines WholeBodySeg.py prints when it actually starts a stage — used to advance
 # the progress bar. Must match the "=== ... ===" headers in WholeBodySeg.py exactly.
 STAGE_LOG_MARKERS = (
@@ -70,6 +80,10 @@ class WholeBodySegGUI:
         self.loaded_config = {}
         self.patient_vars: dict[str, tk.BooleanVar] = {}
         self.stage_vars = {key: tk.BooleanVar(value=False) for key, _, _ in STAGE_FLAGS}
+        self.fat_compartment_mode_var = tk.StringVar(
+            value=FAT_COMPARTMENT_MODE_LABELS[DEFAULT_FAT_COMPARTMENT_MODE]
+        )
+        self.fat_compartment_mode_combo = None
         self.proc = None
         self.busy = False
         self.log_queue: "queue.Queue" = queue.Queue()
@@ -172,9 +186,44 @@ class WholeBodySegGUI:
         # --- Pipeline stages ---
         stages_frame = ttk.LabelFrame(outer, text="Pipeline stages")
         stages_frame.pack(fill="x", **pad)
-        for i, (key, label, indent) in enumerate(STAGE_FLAGS):
-            cb = ttk.Checkbutton(stages_frame, text=label, variable=self.stage_vars[key])
-            cb.grid(row=i, column=0, sticky="w", padx=(20 + indent * 20, 6), pady=1)
+
+        stage_row = 0
+        for key, label, indent in STAGE_FLAGS:
+            command = self._update_fat_compartment_mode_state if key == "run_fat_compartments" else None
+            cb = ttk.Checkbutton(
+                stages_frame,
+                text=label,
+                variable=self.stage_vars[key],
+                command=command,
+            )
+            cb.grid(row=stage_row, column=0, sticky="w", padx=(20 + indent * 20, 6), pady=1)
+            stage_row += 1
+
+            if key == "run_fat_compartments":
+                ttk.Label(stages_frame, text="Fat compartment mode:").grid(
+                    row=stage_row,
+                    column=0,
+                    sticky="w",
+                    padx=(40, 6),
+                    pady=(2, 0),
+                )
+                self.fat_compartment_mode_combo = ttk.Combobox(
+                    stages_frame,
+                    textvariable=self.fat_compartment_mode_var,
+                    state="readonly",
+                    values=list(FAT_COMPARTMENT_MODE_OPTIONS.keys()),
+                    width=31,
+                )
+                self.fat_compartment_mode_combo.grid(
+                    row=stage_row,
+                    column=1,
+                    sticky="w",
+                    padx=(0, 8),
+                    pady=(2, 1),
+                )
+                stage_row += 1
+
+        self._update_fat_compartment_mode_state()
 
         # --- Interpreter ---
         interp_frame = ttk.Frame(outer)
@@ -223,6 +272,13 @@ class WholeBodySegGUI:
         log_frame.pack(fill="both", expand=True, **pad)
         self.log_text = scrolledtext.ScrolledText(log_frame, height=16, state="disabled", font=("Consolas", 9))
         self.log_text.pack(fill="both", expand=True, padx=6, pady=6)
+
+    def _update_fat_compartment_mode_state(self):
+        """Enable the fat-compartment mode selector only when that stage is selected."""
+        if self.fat_compartment_mode_combo is None:
+            return
+        enabled = self.stage_vars["run_fat_compartments"].get()
+        self.fat_compartment_mode_combo.configure(state="readonly" if enabled else "disabled")
 
     # ------------------------------------------------------------------
     # Config loading
@@ -275,6 +331,14 @@ class WholeBodySegGUI:
 
         for key, _label, _indent in STAGE_FLAGS:
             self.stage_vars[key].set(bool(cfg.get(key, False)))
+
+        mode_value = str(
+            cfg.get("fat_compartment_mode", DEFAULT_FAT_COMPARTMENT_MODE)
+        ).strip().lower()
+        if mode_value not in FAT_COMPARTMENT_MODE_LABELS:
+            mode_value = DEFAULT_FAT_COMPARTMENT_MODE
+        self.fat_compartment_mode_var.set(FAT_COMPARTMENT_MODE_LABELS[mode_value])
+        self._update_fat_compartment_mode_state()
 
         self._refresh_patients()
 
@@ -383,6 +447,12 @@ class WholeBodySegGUI:
 
         for key, _label, _indent in STAGE_FLAGS:
             cfg[key] = self.stage_vars[key].get()
+
+        mode_label = self.fat_compartment_mode_var.get().strip()
+        cfg["fat_compartment_mode"] = FAT_COMPARTMENT_MODE_OPTIONS.get(
+            mode_label,
+            DEFAULT_FAT_COMPARTMENT_MODE,
+        )
 
         return cfg
 

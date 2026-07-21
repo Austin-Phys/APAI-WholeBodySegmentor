@@ -15,7 +15,7 @@ Runs after:
 Current version:
   - Builds SAT and IMAT masks using Dixon FF map + MuscleMap muscle segmentation.
   - Builds VAT by carving internal trunk/pelvis fat out of the initial SAT mask using TotalSegmentator anatomy.
-  - Computes SAT, IMAT, and VAT metrics.
+  - Supports build, metrics-only QC re-export, and build-and-metrics modes.
 """
 
 import argparse
@@ -877,6 +877,156 @@ def grow_seeded_mask_inplane(
 
     return grown
 
+
+def _filled_body_mask_inplane(signal: np.ndarray) -> np.ndarray:
+    """Create a stable per-slice body mask from the Dixon signal mask."""
+    out = np.zeros_like(signal, dtype=bool)
+    for z in range(signal.shape[2]):
+        sl = signal[:, :, z].astype(bool)
+        if not np.any(sl):
+            continue
+        body = ndi.binary_fill_holes(sl)
+        out[:, :, z] = _largest_two_components_2d(body)
+    return out
+
+
+def _ellipsoid_structure_mm(radius_mm: float, voxel_spacing) -> np.ndarray:
+    """Return an anisotropic 3-D ellipsoid structuring element defined in millimeters."""
+    radius_mm = max(0.0, float(radius_mm))
+    spacing = np.asarray(voxel_spacing[:3], dtype=float)
+    spacing[spacing <= 0] = 1.0
+
+    if radius_mm <= 0:
+        return np.ones((1, 1, 1), dtype=bool)
+
+    radii_vox = np.maximum(1, np.ceil(radius_mm / spacing).astype(int))
+    grids = np.ogrid[
+        -radii_vox[0]:radii_vox[0] + 1,
+        -radii_vox[1]:radii_vox[1] + 1,
+        -radii_vox[2]:radii_vox[2] + 1,
+    ]
+    distance_sq = (
+        (grids[0] * spacing[0]) ** 2
+        + (grids[1] * spacing[1]) ** 2
+        + (grids[2] * spacing[2]) ** 2
+    )
+    return distance_sq <= (radius_mm ** 2 + 1e-6)
+
+
+def _remove_small_components_preserve_seed(
+    mask: np.ndarray,
+    seed_mask: np.ndarray,
+    voxel_volume_ml: float,
+    min_component_ml: float,
+) -> np.ndarray:
+    """
+    Remove tiny disconnected recovered components while always preserving any
+    component that intersects the trusted original SAT seed.
+    """
+    mask = mask.astype(bool)
+    seed_mask = seed_mask.astype(bool)
+
+    if not np.any(mask) or float(min_component_ml) <= 0:
+        return mask
+
+    labels, n = ndi.label(mask, structure=np.ones((3, 3, 3), dtype=bool))
+    if n == 0:
+        return mask
+
+    counts = np.bincount(labels.ravel())
+    keep = np.zeros(n + 1, dtype=bool)
+    keep[0] = False
+
+    seed_labels = np.unique(labels[seed_mask & mask])
+    seed_labels = seed_labels[seed_labels > 0]
+    keep[seed_labels] = True
+
+    min_voxels = max(1, int(np.ceil(float(min_component_ml) / max(voxel_volume_ml, 1e-12))))
+    component_ids = np.arange(1, n + 1)
+    keep[component_ids[counts[1:] >= min_voxels]] = True
+
+    return keep[labels]
+
+
+def recover_upper_sat_mask(
+    sat_seed: np.ndarray,
+    fat_candidate_sat: np.ndarray,
+    signal: np.ndarray,
+    muscle_exclusion: np.ndarray,
+    vat_mask: np.ndarray,
+    cavity_mask: np.ndarray,
+    trunk_cavity_exclusion: np.ndarray,
+    voxel_spacing,
+    max_iterations: int = 12,
+    surface_band_mm: float = 15.0,
+    close_mm: float = 5.0,
+    min_component_ml: float = 2.0,
+):
+    """
+    Recover missed upper-body SAT from Dixon-positive fat near the body surface.
+
+    TotalSegmentator subcutaneous fat is treated as a trusted seed, not as the
+    complete final SAT segmentation. Recovery is constrained to:
+      - Dixon-positive fat,
+      - the signal-derived body,
+      - tissue outside the abdominal/internal cavity,
+      - tissue outside muscle and VAT,
+      - tissue outside selected thoracic cavity exclusions.
+
+    Returns:
+      final_sat, recovered_additions, surface_seed
+    """
+    sat_seed = sat_seed.astype(bool)
+    filled_body = _filled_body_mask_inplane(signal)
+
+    allowed = (
+        fat_candidate_sat.astype(bool)
+        & filled_body
+        & (~muscle_exclusion.astype(bool))
+        & (~vat_mask.astype(bool))
+        & (~cavity_mask.astype(bool))
+        & (~trunk_cavity_exclusion.astype(bool))
+    )
+
+    # Preserve trusted seed voxels even when a locally imperfect body/cavity mask
+    # would otherwise remove them.
+    growth_domain = allowed | sat_seed
+
+    # Distance to the external background, measured in physical millimeters.
+    # Voxels close to the body boundary provide a second SAT seed in regions
+    # where TotalSegmentator missed the superficial fat shell entirely.
+    surface_distance_mm = ndi.distance_transform_edt(
+        filled_body,
+        sampling=tuple(float(v) for v in voxel_spacing[:3]),
+    )
+    surface_band = filled_body & (surface_distance_mm <= max(0.0, float(surface_band_mm)))
+    surface_seed = allowed & surface_band
+
+    combined_seed = sat_seed | surface_seed
+    recovered = grow_seeded_mask_inplane(
+        seed_mask=combined_seed,
+        allowed_mask=growth_domain,
+        max_iterations=max_iterations,
+    )
+
+    if float(close_mm) > 0:
+        close_structure = _ellipsoid_structure_mm(close_mm, voxel_spacing)
+        recovered = ndi.binary_closing(recovered, structure=close_structure)
+        recovered = recovered & growth_domain
+
+    voxel_volume_ml = float(np.prod(np.asarray(voxel_spacing[:3], dtype=float))) / 1000.0
+    recovered = _remove_small_components_preserve_seed(
+        recovered,
+        seed_mask=sat_seed,
+        voxel_volume_ml=voxel_volume_ml,
+        min_component_ml=min_component_ml,
+    )
+
+    final_sat = (sat_seed | recovered) & (~vat_mask.astype(bool))
+    additions = final_sat & (~sat_seed)
+    return final_sat, additions, surface_seed
+
+
 def build_sat_imat_masks(
     water_path: str,
     fat_path: str,
@@ -916,7 +1066,15 @@ def build_sat_imat_masks(
     thoracic_trunk_fat_labels_ctbl_out: str = None,
     pericardial_fat_mask_out: str = None,
     station_name: str = "",
-    upper_imat_dilate_voxels: int = 1
+    upper_imat_dilate_voxels: int = 1,
+    sat_recovery_enabled: bool = True,
+    sat_recovery_iterations: int = 12,
+    sat_surface_band_mm: float = 15.0,
+    sat_recovery_close_mm: float = 5.0,
+    sat_recovery_min_component_ml: float = 2.0,
+    sat_seed_mask_out: str = None,
+    sat_recovery_added_mask_out: str = None,
+    sat_surface_seed_mask_out: str = None,
 ):
     w_img = nib.load(water_path)
     f_img = nib.load(fat_path)
@@ -927,6 +1085,7 @@ def build_sat_imat_masks(
     f = f_img.get_fdata().astype(np.float32)
     ff = ff_img.get_fdata().astype(np.float32)
     seg = np.rint(seg_img.get_fdata()).astype(np.int32)
+    voxel_spacing = tuple(float(v) for v in ff_img.header.get_zooms()[:3])
 
     signal = (w + f) > signal_threshold
     seg_eroded = erode_segmentation_per_label(seg, iterations=erode_voxels)
@@ -1194,11 +1353,11 @@ def build_sat_imat_masks(
     else:
         vat_mask = np.zeros_like(fat_candidate_vat, dtype=bool)
 
-    # SAT remains driven by the direct subcutaneous-fat mask when available;
-    # otherwise retain the existing fascia/body-shell result. VAT has priority for
-    # any accidental overlap inside the abdominal cavity.
+    # SAT starts from the direct TotalSegmentator subcutaneous-fat result when
+    # available. For upper stations this is now treated as a trusted seed rather
+    # than the complete final SAT segmentation.
     if use_totalseg_exclusions and use_totalseg_subcutaneous_fat_for_sat and np.any(subcutaneous_fat_direct):
-        sat_mask = (
+        sat_seed_mask = (
             subcutaneous_fat_direct
             & signal
             & fat_candidate_sat
@@ -1206,7 +1365,34 @@ def build_sat_imat_masks(
             & (~vat_mask)
         )
     else:
-        sat_mask = sat_pre_cavity_carve & (~vat_mask)
+        sat_seed_mask = sat_pre_cavity_carve & (~vat_mask)
+
+    sat_mask = sat_seed_mask.copy()
+    sat_recovery_added = np.zeros_like(sat_mask, dtype=bool)
+    sat_surface_seed = np.zeros_like(sat_mask, dtype=bool)
+
+    if station_is_upper and sat_recovery_enabled:
+        sat_mask, sat_recovery_added, sat_surface_seed = recover_upper_sat_mask(
+            sat_seed=sat_seed_mask,
+            fat_candidate_sat=fat_candidate_sat,
+            signal=signal,
+            muscle_exclusion=muscle_exclusion_for_fat,
+            vat_mask=vat_mask,
+            cavity_mask=cavity_mask,
+            trunk_cavity_exclusion=trunk_cavity_exclusion,
+            voxel_spacing=voxel_spacing,
+            max_iterations=sat_recovery_iterations,
+            surface_band_mm=sat_surface_band_mm,
+            close_mm=sat_recovery_close_mm,
+            min_component_ml=sat_recovery_min_component_ml,
+        )
+        print(
+            "    Upper-station SAT recovery: TotalSegmentator SAT seed plus "
+            f"surface-constrained Dixon recovery (iterations={int(sat_recovery_iterations)}, "
+            f"surface band={float(sat_surface_band_mm):g} mm, "
+            f"closing={float(sat_recovery_close_mm):g} mm, "
+            f"minimum component={float(sat_recovery_min_component_ml):g} mL)."
+        )
 
     if station_is_upper:
         # Upper-station IMAT is restricted to a tight skeletal-muscle neighborhood.
@@ -1307,296 +1493,43 @@ def build_sat_imat_masks(
         pericardial_fat_mask = thoracic_trunk_fat_labels == 1
         save_like(ff_img, pericardial_fat_mask, pericardial_fat_mask_out, dtype=np.uint8)
 
+    if sat_seed_mask_out:
+        save_like(ff_img, sat_seed_mask, sat_seed_mask_out, dtype=np.uint8)
+
+    if sat_recovery_added_mask_out:
+        save_like(ff_img, sat_recovery_added, sat_recovery_added_mask_out, dtype=np.uint8)
+
+    if sat_surface_seed_mask_out:
+        save_like(ff_img, sat_surface_seed, sat_surface_seed_mask_out, dtype=np.uint8)
+
     if eroded_seg_out:
         save_like(seg_img, seg_eroded, eroded_seg_out, dtype=np.int16)
 
 
-def _empty_stats():
-    """Stats placeholder for slices/compartments with zero valid voxels."""
-    return {
-        "mean": np.nan,
-        "median": np.nan,
-        "std": np.nan,
-        "min": np.nan,
-        "max": np.nan,
-    }
 
-
-def compute_binary_mask_metrics(mask_path, ff_map_path, subject, day, compartment_name, out_dir):
-    """
-    Compute volume and per-slice metrics for a binary compartment mask.
-
-    Important behavior:
-      - The volume CSV contains the total compartment volume/statistics.
-      - The slice CSV now writes one row for EVERY Dixon slice, even when the
-        compartment is absent on that slice. Empty slices get n_voxels=0,
-        CSA_cm2=0, and NaN statistics.
-
-    This makes SAT/VAT/IMAT slice CSVs directly comparable by slice_index.
-    """
-    mask_img = nib.load(mask_path)
-    ff_img = nib.load(ff_map_path)
-
-    mask = mask_img.get_fdata() > 0
-    ff = ff_img.get_fdata()
-
-    dx, dy, dz = nib.affines.voxel_sizes(ff_img.affine)
-    pixel_area_cm2 = float(dx * dy) / 100.0
-    voxel_vol_ml = float(dx * dy * dz) / 1000.0
-
-    vals = ff[mask]
-    vals = vals[np.isfinite(vals)]
-
-    vol_rows = []
-    if vals.size > 0:
-        stats = summarize(vals)
-        vol_rows.append({
-            "compartment": compartment_name,
-            "n_voxels": int(vals.size),
-            "volume_ml": int(vals.size) * voxel_vol_ml,
-            **stats
-        })
-    else:
-        vol_rows.append({
-            "compartment": compartment_name,
-            "n_voxels": 0,
-            "volume_ml": 0.0,
-            **_empty_stats()
-        })
-
-    slice_rows = []
-    zdim = mask.shape[2]
-    for z in range(zdim):
-        sl_mask = mask[:, :, z]
-        vals_z = ff[:, :, z][sl_mask]
-        vals_z = vals_z[np.isfinite(vals_z)]
-
-        if vals_z.size > 0:
-            stats = summarize(vals_z)
-            n_vox = int(vals_z.size)
-        else:
-            stats = _empty_stats()
-            n_vox = 0
-
-        slice_rows.append({
-            "slice_index": int(z),
-            "compartment": compartment_name,
-            "n_voxels": n_vox,
-            "CSA_cm2": n_vox * pixel_area_cm2,
-            **stats
-        })
-
-    tag = f"{subject}_{day}" if day else subject
-
-    pd.DataFrame(vol_rows).to_csv(
-        os.path.join(out_dir, f"{tag}_{compartment_name}_volume.csv"),
-        index=False
-    )
-    pd.DataFrame(slice_rows).to_csv(
-        os.path.join(out_dir, f"{tag}_{compartment_name}_slice.csv"),
-        index=False
-    )
-
-
-def compute_fat_compartment_slice_comparison(mask_paths: dict, ff_map_path, subject, day, out_dir):
-    """
-    Create one wide per-slice CSV for direct compartment comparison.
-
-    Output columns include, for each compartment:
-      <Compartment>_n_voxels
-      <Compartment>_CSA_cm2
-      <Compartment>_mean
-      <Compartment>_median
-      <Compartment>_std
-      <Compartment>_min
-      <Compartment>_max
-
-    This is intended for direct VAT-vs-SAT comparisons on identical Dixon slices.
-    """
-    ff_img = nib.load(ff_map_path)
-    ff = ff_img.get_fdata()
-
-    dx, dy, dz = nib.affines.voxel_sizes(ff_img.affine)
-    pixel_area_cm2 = float(dx * dy) / 100.0
-
-    masks = {}
-    for compartment_name, mask_path in mask_paths.items():
-        mask_img = nib.load(mask_path)
-        mask = mask_img.get_fdata() > 0
-        if mask.shape != ff.shape:
-            raise ValueError(
-                f"Mask shape mismatch for {compartment_name}: "
-                f"mask={mask.shape}, FF={ff.shape}"
-            )
-        masks[compartment_name] = mask
-
-    rows = []
-    for z in range(ff.shape[2]):
-        row = {"slice_index": int(z)}
-        for compartment_name, mask in masks.items():
-            sl_mask = mask[:, :, z]
-            vals_z = ff[:, :, z][sl_mask]
-            vals_z = vals_z[np.isfinite(vals_z)]
-
-            if vals_z.size > 0:
-                stats = summarize(vals_z)
-                n_vox = int(vals_z.size)
-            else:
-                stats = _empty_stats()
-                n_vox = 0
-
-            prefix = str(compartment_name)
-            row[f"{prefix}_n_voxels"] = n_vox
-            row[f"{prefix}_CSA_cm2"] = n_vox * pixel_area_cm2
-            for stat_name, stat_value in stats.items():
-                row[f"{prefix}_{stat_name}"] = stat_value
-
-        rows.append(row)
-
-    tag = f"{subject}_{day}" if day else subject
-    out_path = os.path.join(out_dir, f"{tag}_fat_compartment_slice_comparison.csv")
-    pd.DataFrame(rows).to_csv(out_path, index=False)
-    print(f"    saved: {out_path}")
-
-
-
-def compute_fat_compartment_vat_slice_volume_comparison(mask_paths: dict, ff_map_path, subject, day, out_dir):
-    """
-    Create one summary CSV comparing SAT, IMAT, and VAT volumes using ONLY the
-    Dixon slices where VAT is present.
-
-    This is useful when SAT and VAT need to be compared across the exact same
-    anatomical z-range. The slice range is defined by VAT_mask > 0 on a slice.
-    """
-    ff_img = nib.load(ff_map_path)
-    ff = ff_img.get_fdata()
-
-    dx, dy, dz = nib.affines.voxel_sizes(ff_img.affine)
-    voxel_vol_ml = float(dx * dy * dz) / 1000.0
-
-    masks = {}
-    for compartment_name, mask_path in mask_paths.items():
-        mask_img = nib.load(mask_path)
-        mask = mask_img.get_fdata() > 0
-        if mask.shape != ff.shape:
-            raise ValueError(
-                f"Mask shape mismatch for {compartment_name}: "
-                f"mask={mask.shape}, FF={ff.shape}"
-            )
-        masks[compartment_name] = mask
-
-    if "VAT" not in masks:
-        raise ValueError("VAT mask is required to define VAT-containing slices.")
-
-    vat_by_slice = np.any(masks["VAT"], axis=(0, 1))
-    vat_slice_indices = np.where(vat_by_slice)[0].astype(int).tolist()
-
-    rows = []
-    for compartment_name, mask in masks.items():
-        restricted_mask = mask.copy()
-        if vat_by_slice.size != restricted_mask.shape[2]:
-            raise ValueError("VAT slice vector length does not match mask z-dimension.")
-
-        # Keep only slices where VAT exists.
-        restricted_mask[:, :, ~vat_by_slice] = False
-
-        vals = ff[restricted_mask]
-        vals = vals[np.isfinite(vals)]
-
-        if vals.size > 0:
-            stats = summarize(vals)
-            n_vox = int(vals.size)
-        else:
-            stats = _empty_stats()
-            n_vox = 0
-
-        rows.append({
-            "restriction": "slices_with_VAT",
-            "compartment": compartment_name,
-            "vat_slice_count": int(len(vat_slice_indices)),
-            "vat_slice_indices": ";".join(str(x) for x in vat_slice_indices),
-            "n_voxels": n_vox,
-            "volume_ml": n_vox * voxel_vol_ml,
-            **stats,
-        })
-
-    tag = f"{subject}_{day}" if day else subject
-    out_path = os.path.join(out_dir, f"{tag}_fat_compartment_volume_in_VAT_slices.csv")
-    pd.DataFrame(rows).to_csv(out_path, index=False)
-    print(f"    saved: {out_path}")
-
-def compute_label_map_metrics(label_map_path, label_csv_path, ff_map_path, subject, day, out_dir):
-    """Compute volume/slice metrics for every nonzero label in a multi-label map."""
-    label_img = nib.load(label_map_path)
-    ff_img = nib.load(ff_map_path)
-
-    labels = np.rint(label_img.get_fdata()).astype(np.int32)
-    ff = ff_img.get_fdata()
-
-    dx, dy, dz = nib.affines.voxel_sizes(ff_img.affine)
-    pixel_area_cm2 = float(dx * dy) / 100.0
-    voxel_vol_ml = float(dx * dy * dz) / 1000.0
-
-    lookup = pd.read_csv(label_csv_path)
-    id_col = "LabelID" if "LabelID" in lookup.columns else lookup.columns[0]
-    name_col = "Name" if "Name" in lookup.columns else lookup.columns[1]
-
-    tag = f"{subject}_{day}" if day else subject
-
-    for _, row in lookup.iterrows():
-        label_id = int(row[id_col])
-        compartment_name = str(row[name_col])
-        mask = labels == label_id
-
-        vals = ff[mask]
-        vals = vals[np.isfinite(vals)]
-
-        vol_rows = []
-        if vals.size > 0:
-            stats = summarize(vals)
-            vol_rows.append({
-                "compartment": compartment_name,
-                "label_id": label_id,
-                "n_voxels": int(vals.size),
-                "volume_ml": int(vals.size) * voxel_vol_ml,
-                **stats,
-            })
-
-        slice_rows = []
-        for z in range(labels.shape[2]):
-            sl_mask = mask[:, :, z]
-            if not np.any(sl_mask):
-                continue
-
-            vals_z = ff[:, :, z][sl_mask]
-            vals_z = vals_z[np.isfinite(vals_z)]
-            if vals_z.size == 0:
-                continue
-
-            stats = summarize(vals_z)
-            slice_rows.append({
-                "slice_index": int(z),
-                "compartment": compartment_name,
-                "label_id": label_id,
-                "n_voxels": int(vals_z.size),
-                "CSA_cm2": int(vals_z.size) * pixel_area_cm2,
-                **stats,
-            })
-
-        pd.DataFrame(vol_rows).to_csv(
-            os.path.join(out_dir, f"{tag}_{compartment_name}_volume.csv"),
-            index=False,
-        )
-        pd.DataFrame(slice_rows).to_csv(
-            os.path.join(out_dir, f"{tag}_{compartment_name}_slice.csv"),
-            index=False,
-        )
+try:
+    # Normal WholeBodySeg package import:
+    #   from scripts.fat_compartment_pipeline import run_fat_compartments
+    from .fat_compartment_metrics import export_all_fat_compartment_metrics
+except ImportError:
+    # Allows direct execution from inside the scripts directory.
+    from fat_compartment_metrics import export_all_fat_compartment_metrics
 
 def main():
     ap = argparse.ArgumentParser(description="WholeBodySeg SAT/IMAT fat compartment module.")
     ap.add_argument("--subject", required=True)
     ap.add_argument("--day", default="")
     ap.add_argument("--dir", required=True)
+    ap.add_argument(
+        "--mode",
+        choices=["build", "metrics", "build_and_metrics"],
+        default="build_and_metrics",
+        help=(
+            "build: create/overwrite QC masks only; "
+            "metrics: preserve current QC masks and regenerate CSVs only; "
+            "build_and_metrics: current full pipeline behavior"
+        ),
+    )
     ap.add_argument("--signal_threshold", type=float, default=50.0)
     ap.add_argument("--fat_ff_threshold_imat", type=float, default=0.2)
     ap.add_argument("--fat_ff_threshold_sat", type=float, default=0.3)
@@ -1618,9 +1551,21 @@ def main():
     ap.add_argument("--disable_totalseg_exclusions", action="store_true")
     ap.add_argument("--station", default="", help="Station name, typically Upper or Lower")
     ap.add_argument("--upper_imat_dilate_voxels", type=int, default=1)
+    ap.add_argument("--disable_sat_recovery", action="store_true")
+    ap.add_argument("--sat_recovery_iterations", type=int, default=12)
+    ap.add_argument("--sat_surface_band_mm", type=float, default=15.0)
+    ap.add_argument("--sat_recovery_close_mm", type=float, default=5.0)
+    ap.add_argument("--sat_recovery_min_component_ml", type=float, default=2.0)
+    ap.add_argument("--save_sat_recovery_masks", action="store_true")
     args = ap.parse_args()
 
     base = args.dir
+
+    # Metrics-only mode deliberately skips every segmentation-generation step.
+    # Existing masks in eroded_mask_for_qc are treated as the post-QC source of truth.
+    if args.mode == "metrics":
+        export_all_fat_compartment_metrics(base, args.subject, args.day)
+        return
 
     w_path, f_path, ff_path, seg_path = find_required_dixon_inputs(base)
 
@@ -1645,6 +1590,9 @@ def main():
     thoracic_trunk_fat_labels_csv_path = os.path.join(qc_dir, "Thoracic_trunk_fat_labels.csv")
     thoracic_trunk_fat_labels_ctbl_path = os.path.join(qc_dir, "Thoracic_trunk_fat_labels.ctbl")
     pericardial_fat_mask_path = os.path.join(qc_dir, "PericardialFat_mask.nii.gz")
+    sat_seed_mask_path = os.path.join(qc_dir, "SAT_mask_seed.nii.gz")
+    sat_recovery_added_mask_path = os.path.join(qc_dir, "SAT_mask_recovery_added.nii.gz")
+    sat_surface_seed_mask_path = os.path.join(qc_dir, "SAT_mask_surface_seed.nii.gz")
 
     print("Building SAT, IMAT, VAT, abdominal cavity, and thoracic trunk fat QC masks")
     build_sat_imat_masks(
@@ -1686,65 +1634,21 @@ def main():
         thoracic_trunk_fat_labels_ctbl_out=thoracic_trunk_fat_labels_ctbl_path,
         pericardial_fat_mask_out=pericardial_fat_mask_path,
         station_name=args.station,
-        upper_imat_dilate_voxels=args.upper_imat_dilate_voxels
+        upper_imat_dilate_voxels=args.upper_imat_dilate_voxels,
+        sat_recovery_enabled=not args.disable_sat_recovery,
+        sat_recovery_iterations=args.sat_recovery_iterations,
+        sat_surface_band_mm=args.sat_surface_band_mm,
+        sat_recovery_close_mm=args.sat_recovery_close_mm,
+        sat_recovery_min_component_ml=args.sat_recovery_min_component_ml,
+        sat_seed_mask_out=sat_seed_mask_path if args.save_sat_recovery_masks else None,
+        sat_recovery_added_mask_out=sat_recovery_added_mask_path if args.save_sat_recovery_masks else None,
+        sat_surface_seed_mask_out=sat_surface_seed_mask_path if args.save_sat_recovery_masks else None,
     )
 
-    print("Computing SAT metrics")
-    compute_binary_mask_metrics(sat_mask_path, ff_path, args.subject, args.day, "SAT", csv_dir)
-
-    print("Computing IMAT metrics")
-    compute_binary_mask_metrics(imat_mask_path, ff_path, args.subject, args.day, "IMAT", csv_dir)
-
-    print("Computing VAT metrics")
-    compute_binary_mask_metrics(vat_mask_path, ff_path, args.subject, args.day, "VAT", csv_dir)
-
-    print("Computing fat compartment slice comparison")
-    compute_fat_compartment_slice_comparison(
-        {
-            "SAT": sat_mask_path,
-            "IMAT": imat_mask_path,
-            "VAT": vat_mask_path,
-        },
-        ff_path,
-        args.subject,
-        args.day,
-        csv_dir,
-    )
-
-    print("Computing fat compartment volumes restricted to VAT-containing slices")
-    compute_fat_compartment_vat_slice_volume_comparison(
-        {
-            "SAT": sat_mask_path,
-            "IMAT": imat_mask_path,
-            "VAT": vat_mask_path,
-        },
-        ff_path,
-        args.subject,
-        args.day,
-        csv_dir,
-    )
-
-    print("Computing thoracic trunk fat metrics")
-    compute_label_map_metrics(
-        thoracic_trunk_fat_labels_path,
-        thoracic_trunk_fat_labels_csv_path,
-        ff_path,
-        args.subject,
-        args.day,
-        csv_dir,
-    )
-
-    print("Computing standalone pericardial fat metrics")
-    compute_binary_mask_metrics(
-        pericardial_fat_mask_path,
-        ff_path,
-        args.subject,
-        args.day,
-        "PericardialFat",
-        csv_dir,
-    )
-
-    print("Fat compartment module DONE")
+    if args.mode == "build_and_metrics":
+        export_all_fat_compartment_metrics(base, args.subject, args.day)
+    else:
+        print("Fat compartment mask build DONE (CSV export skipped by --mode build)")
 
 
 def run_fat_compartments(station_dir, cfg):
@@ -1759,6 +1663,7 @@ def run_fat_compartments(station_dir, cfg):
         "--subject", subject,
         "--day", session,
         "--dir", str(station_dir),
+        "--mode", str(cfg.get("fat_compartment_mode", "build_and_metrics")),
         "--signal_threshold", str(cfg.get("signal_threshold", 50.0)),
         "--fat_ff_threshold_imat", str(cfg.get("fat_ff_threshold_imat", 0.2)),
         "--fat_ff_threshold_sat", str(cfg.get("fat_ff_threshold_sat", 0.3)),
@@ -1774,6 +1679,10 @@ def run_fat_compartments(station_dir, cfg):
         "--abdominal_wall_close_size", str(cfg.get("abdominal_wall_close_size", 7)),
         "--station", station_dir.name,
         "--upper_imat_dilate_voxels", str(cfg.get("upper_imat_dilate_voxels", 1)),
+        "--sat_recovery_iterations", str(cfg.get("sat_recovery_iterations", 12)),
+        "--sat_surface_band_mm", str(cfg.get("sat_surface_band_mm", 15.0)),
+        "--sat_recovery_close_mm", str(cfg.get("sat_recovery_close_mm", 5.0)),
+        "--sat_recovery_min_component_ml", str(cfg.get("sat_recovery_min_component_ml", 2.0)),
     ]
 
     if not cfg.get("use_totalseg_abdominal_cavity", True):
@@ -1793,6 +1702,12 @@ def run_fat_compartments(station_dir, cfg):
 
     if not cfg.get("use_totalseg_fat_exclusions", True):
         sys.argv += ["--disable_totalseg_exclusions"]
+
+    if not cfg.get("sat_recovery_enabled", True):
+        sys.argv += ["--disable_sat_recovery"]
+
+    if cfg.get("save_sat_recovery_masks", False):
+        sys.argv += ["--save_sat_recovery_masks"]
 
     try:
         main()

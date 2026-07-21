@@ -1,21 +1,16 @@
 {
-  "study_name": "PAD",
-  "data_root": "c:/Research/Muscle Map_Dhanush_Version/WholeBodySeg/data/PAD",
+  "study_name": "ASHA",
+  "data_root": "C:/Research/APAI-WBS-FAT/data/ASHA",
   "subjects": [
-    "HC001"
+    "P010"
   ],
-  "sessions": [
-    "D1",
-    "D2"
-  ],
+  "sessions": null,
   "use_station_folders": true,
   "stations": [
+    "Upper",
     "Lower"
   ],
-  "water_image_name": "Dixon_W_COMP.nii.gz",
-  "fat_image_name": "Dixon_F_COMP.nii.gz",
-  "ff_map_name": "Dixon_FF_map.nii.gz",
-  "run_dicom_to_nifti": true,
+  "run_dicom_to_nifti": false,
   "dicom_force_reconvert": false,
   "dicom_print_series_inventory": false,
   "run_musclemap_dixon": true,
@@ -23,14 +18,16 @@
   "run_totalseg": true,
   "run_fat_compartments": true,
   "totalseg_fast": true,
-  "totalseg_auto_fast_fallback": false,
+  "totalseg_auto_fast_fallback": true,
   "t2_images": {
     "Thigh": "T2_Grappa_Thigh.nii.gz",
     "Calf": "T2_Grappa_Calf.nii.gz"
   },
   "run_totalseg_extra_subtasks": true,
-  "include_extra_subtasks_in_combined_label": false,
-  "totalseg_extra_subtasks": [],
+  "include_extra_subtasks_in_combined_label": true,
+  "totalseg_extra_subtasks": [
+    "thigh_shoulder_muscles_mr"
+  ],
   "totalseg_qc_only_subtasks": [
     "tissue_types_mr",
     "body_mr"
@@ -38,12 +35,12 @@
   "skip_musclemap_t2_448_seg": false,
   "skip_musclemap_t2_448_metrics": false,
   "session_folder_name": "Musclemap Data",
-  "dcm2niix_path": "c:/Research/Muscle Map_Dhanush_Version/WholeBodySeg/tools/dcm2niix.exe",
-  "musclemap_repo": "c:/Research/Muscle Map_Dhanush_Version/WholeBodySeg/MuscleMap",
-  "code_dir": "c:/Research/Muscle Map_Dhanush_Version/WholeBodySeg",
+  "dcm2niix_path": "C:/Research/APAI-WBS-FAT/tools/dcm2niix.exe",
+  "musclemap_repo": "C:/Research/APAI-WBS-FAT/MuscleMap",
+  "code_dir": "C:/Research/APAI-WBS-FAT",
   "compute_mode": "auto",
   "signal_threshold": 50.0,
-  "fat_ff_threshold_imat": 0.2,
+  "fat_ff_threshold_imat": 0.3,
   "fat_ff_threshold_sat": 0.3,
   "fat_ff_threshold_vat": 0.3,
   "fascia_dilate_size": 5,
@@ -59,12 +56,24 @@
   "use_totalseg_torso_fat_for_vat": true,
   "use_totalseg_subcutaneous_fat_for_sat": true,
   "totalseg_tissue_types_mr_folder": "TS_TISSUE_TYPES_MR",
-  "totalseg_skip_existing": true,
+  "totalseg_skip_existing": false,
   "totalseg_overwrite": true,
   "totalseg_overwrite_trunk_cavities": true,
   "totalseg_overwrite_extra_subtasks": true,
   "totalseg_skip_extra_subtasks": false,
   "abdominal_cavity_superior_cutoff": "mid_lung",
   "abdominal_cavity_superior_cutoff_extra_slices": 0,
-  "run_summary": true
+  "run_summary": true,
+  "upper_imat_dilate_voxels": 1,
+  "vat_recovery_iterations": 10,
+  "totalseg_force_split": false,
+  "totalseg_nr_thr_saving": 4,
+  "save_vat_recovery_mask": false,
+  "fat_compartment_mode": "build_and_metrics",
+  "sat_recovery_enabled": true,
+  "sat_recovery_iterations": 12,
+  "sat_surface_band_mm": 15.0,
+  "sat_recovery_close_mm": 5.0,
+  "sat_recovery_min_component_ml": 2.0,
+  "save_sat_recovery_masks": true
 }

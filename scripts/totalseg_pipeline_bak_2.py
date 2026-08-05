@@ -11,11 +11,6 @@ For one station folder, runs:
    - Volume metrics from the full label map
    - FF metrics from the eroded label map
 
-Robustness behavior:
-- The primary total_mr task remains required/fatal if it fails.
-- Optional subtasks (trunk_cavities, abdominal_muscles, extra/QC subtasks) are
-  non-fatal: a failure is logged, partial output is removed, and processing continues.
-
 Required scripts in the same folder as this wrapper:
     combine_totalseg_masks_nonMuscleMap.py
     erode_totalseg_labels.py
@@ -225,55 +220,6 @@ def maybe_run_totalsegmentator_subtask(
     )
 
 
-def run_optional_subtask_safely(
-    water: Path,
-    out_dir: Path,
-    task: str,
-    enabled: bool,
-    skip_existing: bool,
-    overwrite: bool,
-    use_fast: bool,
-    auto_fast_fallback: bool,
-):
-    """Run an optional TotalSegmentator subtask without aborting the whole batch.
-
-    The primary ``total_mr`` task is still treated as required and remains fatal if it
-    fails.  Auxiliary tasks (for example ``trunk_cavities``) are allowed to fail for
-    one station/subject so the rest of the TotalSegmentator workflow and the larger
-    multi-subject batch can continue.
-
-    Any partial output directory created by a failed subtask is removed.  This is
-    important because a future run must not mistake an incomplete folder containing
-    one or more NIfTI files for a successfully completed subtask.
-    """
-    try:
-        return maybe_run_totalsegmentator_subtask(
-            water=water,
-            out_dir=out_dir,
-            task=task,
-            enabled=enabled,
-            skip_existing=skip_existing,
-            overwrite=overwrite,
-            use_fast=use_fast,
-            auto_fast_fallback=auto_fast_fallback,
-        )
-    except Exception as err:
-        print("\n" + "!" * 78)
-        print(f"WARNING: Optional TotalSegmentator subtask failed: {task}")
-        print(f"Station working directory: {Path.cwd()}")
-        print(f"Error: {type(err).__name__}: {err}")
-        print("This subtask failure is NON-FATAL. The pipeline will continue.")
-
-        if out_dir.exists():
-            try:
-                print(f"Removing partial failed-subtask output: {out_dir}")
-                shutil.rmtree(out_dir)
-            except Exception as cleanup_err:
-                print(f"WARNING: Could not remove partial output {out_dir}: {cleanup_err}")
-
-        print("!" * 78 + "\n")
-        return f"FAILED_NONFATAL ({type(err).__name__}: {err})"
-
 
 def task_to_folder_name(task: str) -> str:
     """Convert a TotalSegmentator task name to a stable output folder name."""
@@ -427,7 +373,7 @@ def main():
     subtask_use_fast = False
     subtask_auto_fast_fallback = False
 
-    trunk_cavities_mode = run_optional_subtask_safely(
+    trunk_cavities_mode = maybe_run_totalsegmentator_subtask(
         water=water,
         out_dir=trunk_cavities_dir,
         task="trunk_cavities",
@@ -438,7 +384,7 @@ def main():
         auto_fast_fallback=subtask_auto_fast_fallback,
     )
 
-    abdominal_muscles_mode = run_optional_subtask_safely(
+    abdominal_muscles_mode = maybe_run_totalsegmentator_subtask(
         water=water,
         out_dir=abdominal_muscles_dir,
         task="abdominal_muscles",
@@ -455,7 +401,7 @@ def main():
     if args.run_extra_subtasks:
         for task in args.extra_subtasks:
             out_dir = Path(task_to_folder_name(task))
-            mode = run_optional_subtask_safely(
+            mode = maybe_run_totalsegmentator_subtask(
                 water=water,
                 out_dir=out_dir,
                 task=task,
@@ -469,7 +415,7 @@ def main():
 
         for task in args.qc_only_subtasks:
             out_dir = Path(task_to_folder_name(task))
-            mode = run_optional_subtask_safely(
+            mode = maybe_run_totalsegmentator_subtask(
                 water=water,
                 out_dir=out_dir,
                 task=task,

@@ -1353,36 +1353,21 @@ def build_sat_imat_masks(
     else:
         vat_mask = np.zeros_like(fat_candidate_vat, dtype=bool)
 
-    # Station-specific SAT classification:
-    #   Upper: use TotalSegmentator subcutaneous fat as a trusted seed and retain
-    #          the newer surface-constrained Dixon recovery process.
-    #   Lower: restore the original validated fascia-based SAT result generated
-    #          during the slice-wise pass. Do not replace lower SAT with the
-    #          TotalSegmentator subcutaneous-fat mask or run seeded recovery.
-    if station_is_upper:
-        if (
-            use_totalseg_exclusions
-            and use_totalseg_subcutaneous_fat_for_sat
-            and np.any(subcutaneous_fat_direct)
-        ):
-            sat_seed_mask = (
-                subcutaneous_fat_direct
-                & signal
-                & fat_candidate_sat
-                & (~muscle_exclusion_for_fat)
-                & (~vat_mask)
-            )
-        else:
-            sat_seed_mask = sat_pre_cavity_carve & (~vat_mask)
-
-        sat_mask = sat_seed_mask.copy()
+    # SAT starts from the direct TotalSegmentator subcutaneous-fat result when
+    # available. For upper stations this is now treated as a trusted seed rather
+    # than the complete final SAT segmentation.
+    if use_totalseg_exclusions and use_totalseg_subcutaneous_fat_for_sat and np.any(subcutaneous_fat_direct):
+        sat_seed_mask = (
+            subcutaneous_fat_direct
+            & signal
+            & fat_candidate_sat
+            & (~muscle_exclusion_for_fat)
+            & (~vat_mask)
+        )
     else:
-        # Original lower-body SAT process: Dixon-positive fat inside the body and
-        # outside the fascia, with VAT removed to keep compartments exclusive.
         sat_seed_mask = sat_pre_cavity_carve & (~vat_mask)
-        sat_mask = sat_seed_mask.copy()
-        print("    Lower-station SAT logic: restored original fascia-based SAT classification.")
 
+    sat_mask = sat_seed_mask.copy()
     sat_recovery_added = np.zeros_like(sat_mask, dtype=bool)
     sat_surface_seed = np.zeros_like(sat_mask, dtype=bool)
 
@@ -1435,11 +1420,9 @@ def build_sat_imat_masks(
             f"IMAT restricted to muscle support (dilation={dilate_iter} voxel(s))."
         )
     else:
-        # Preserve the validated lower-body fascia-based IMAT behavior. Together
-        # with the restored SAT branch above, Lower now uses the original paired
-        # fascia-based SAT/IMAT classification.
+        # Preserve the validated lower-body fascia-based IMAT behavior.
         imat_mask = imat_pre_cavity_carve & (~vat_mask) & (~sat_mask)
-        print("    Lower-station IMAT logic: preserving original fascia-based classification.")
+        print("    Lower-station logic: preserving fascia-based IMAT classification.")
 
     # Build a mutually exclusive thoracic trunk fat label map from the explicit
     # TotalSegmentator trunk_cavities outputs. These labels are intentionally

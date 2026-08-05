@@ -767,12 +767,12 @@ def find_sessions() -> List[Path]:
                     if candidate.is_dir():
                         sessions.append(candidate)
                     else:
-                        print(f"WARNING: Session folder not found - skipping: {candidate}")
+                        print(f"⚠️ Session folder not found — skipping: {candidate}")
             else:
                 if subject_dir.is_dir():
                     sessions.append(subject_dir)
                 else:
-                    print(f"WARNING: Subject folder not found - skipping: {subject_dir}")
+                    print(f"⚠️ Subject folder not found — skipping: {subject_dir}")
 
         return sessions
 

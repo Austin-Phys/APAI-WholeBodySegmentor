@@ -1,6 +1,6 @@
 {
   "study_name": "ASHA",
-  "data_root": "C:/Research/APAI-WBS-FAT/data/ASHA",
+  "data_root": "C:\\Users\\kadav\\Documents\\MATLab Code Offline\\APAI-WBS-MMv1.4/data/ASHA",
   "subjects": [
     "P010"
   ],
@@ -30,14 +30,15 @@
   ],
   "totalseg_qc_only_subtasks": [
     "tissue_types_mr",
-    "body_mr"
+    "body_mr",
+    "vertebrae_mr"
   ],
   "skip_musclemap_t2_448_seg": false,
   "skip_musclemap_t2_448_metrics": false,
   "session_folder_name": "Musclemap Data",
-  "dcm2niix_path": "C:/Research/APAI-WBS-FAT/tools/dcm2niix.exe",
-  "musclemap_repo": "C:/Research/APAI-WBS-FAT/MuscleMap",
-  "code_dir": "C:/Research/APAI-WBS-FAT",
+  "dcm2niix_path": "C:\\Users\\kadav\\Documents\\MATLab Code Offline\\APAI-WBS-MMv1.4/tools/dcm2niix.exe",
+  "musclemap_repo": "C:\\Users\\kadav\\Documents\\MATLab Code Offline\\APAI-WBS-MMv1.4/MuscleMap",
+  "code_dir": "C:\\Users\\kadav\\Documents\\MATLab Code Offline\\APAI-WBS-MMv1.4",
   "compute_mode": "auto",
   "signal_threshold": 50.0,
   "fat_ff_threshold_imat": 0.3,
@@ -71,9 +72,23 @@
   "save_vat_recovery_mask": false,
   "fat_compartment_mode": "build_and_metrics",
   "sat_recovery_enabled": true,
-  "sat_recovery_iterations": 12,
-  "sat_surface_band_mm": 15.0,
-  "sat_recovery_close_mm": 5.0,
-  "sat_recovery_min_component_ml": 2.0,
-  "save_sat_recovery_masks": true
+  "sat_recovery_iterations": 3,
+  "sat_surface_band_mm": 0.0,
+  "sat_recovery_close_mm": 2.0,
+  "sat_recovery_min_component_ml": 0.0,
+  "save_sat_recovery_masks": true,
+  "fat_image_name": "Dixon_F_COMP.nii.gz",
+  "upper_tissue_types_mr_use_dixon_f": true,
+  "upper_sat_recovery_ff_threshold": 0.2,
+  "upper_sat_fill_holes": true,
+  "upper_sat_max_hole_ml": 5.0,
+  "upper_sat_remove_arms": true,
+  "upper_sat_trunk_erode_voxels": 4,
+  "upper_sat_gap_fill_close_mm": 4.0,
+  "totalseg_upper_only_qc_subtasks": [
+    "vertebrae_mr"
+  ],
+  "use_totalseg_vertebrae_mr_exclusion": true,
+  "totalseg_vertebrae_mr_folder": "TS_VERTEBRAE_MR",
+  "musclemap_model_version": "1.4"
 }

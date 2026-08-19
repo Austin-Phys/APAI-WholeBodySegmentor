@@ -56,15 +56,19 @@ FAT_COMPARTMENT_MODE_LABELS = {
 }
 DEFAULT_FAT_COMPARTMENT_MODE = "build_and_metrics"
 
-# Log lines WholeBodySeg.py prints when it actually starts a stage — used to advance
-# the progress bar. Must match the "=== ... ===" headers in WholeBodySeg.py exactly.
-STAGE_LOG_MARKERS = (
-    "=== MuscleMap Dixon ===",
-    "=== TotalSegmentator ===",
-    "=== Fat compartments ===",
-    "=== MuscleMap T2-448 ===",
-    "=== WholeBodySeg summary CSVs ===",
-)
+# Machine-readable progress events emitted by WholeBodySeg.py.
+PROGRESS_PREFIX = "[WBS_PROGRESS]"
+
+# Relative runtime weights. These are intentionally approximate; they make the
+# progress percentage and ETA more realistic than treating every stage equally.
+STAGE_WEIGHTS = {
+    "dicom": 15.0,
+    "musclemap_dixon": 20.0,
+    "totalseg": 40.0,
+    "fat_compartments": 10.0,
+    "musclemap_t2_448": 10.0,
+    "summary": 5.0,
+}
 
 DONE_SENTINEL = object()
 
@@ -91,11 +95,19 @@ class WholeBodySegGUI:
         self.progress_determinate = False
         self.progress_total = 0
         self.progress_completed = 0
+        self.progress_total_weight = 1.0
+        self.progress_completed_weight = 0.0
+        self.progress_elapsed_at_last_completion = 0.0
+        self.completed_progress_events = set()
+        self.current_stage_key = ""
+        self.current_stage_text = ""
         self.run_start_time = None
+        self.stop_requested = False
 
         self._build_widgets()
         self._populate_config_dropdown()
         self.root.after(100, self._poll_log_queue)
+        self.root.after(1000, self._update_progress_clock)
 
     def _set_window_icon(self):
         """Set the title-bar/taskbar icon from gui/assets/Icon.ico (falls back to Icon.png)."""
@@ -260,6 +272,10 @@ class WholeBodySegGUI:
 
         progress_frame = ttk.Frame(outer)
         progress_frame.pack(fill="x", **pad)
+        self.current_stage_var = tk.StringVar(value="Current: —")
+        ttk.Label(progress_frame, textvariable=self.current_stage_var).pack(
+            anchor="w", pady=(0, 2)
+        )
         self.progress = ttk.Progressbar(progress_frame, mode="indeterminate")
         self.progress.pack(fill="x", expand=True)
         self.progress_label_var = tk.StringVar(value="")
@@ -457,26 +473,41 @@ class WholeBodySegGUI:
         return cfg
 
     @staticmethod
-    def _estimate_total_steps(cfg: dict) -> int:
-        """Rough step count matching WholeBodySeg.py's subject/session/station loop.
-
-        Doesn't need to be exact (e.g. it can't predict a station folder that fails to
-        materialize and gets skipped) — just close enough for a useful ETA.
-        """
+    def _estimate_progress_plan(cfg: dict):
+        """Return (stage_count, total_weight) for the selected run."""
         n_subjects = len(cfg.get("subjects") or []) or 1
         n_sessions = len(cfg.get("sessions") or [None]) or 1
         n_stations = len(cfg.get("stations") or []) or 1
 
-        per_station_stages = sum(
-            1 for key in ("run_musclemap_dixon", "run_totalseg", "run_fat_compartments") if cfg.get(key)
-        )
-        # T2-448 runs once per session (skipped on the 2nd+ station), not once per station.
-        per_session_stages = 1 if cfg.get("run_musclemap_t2_448") else 0
+        stage_count = 0
+        total_weight = 0.0
 
-        total = n_subjects * n_sessions * (n_stations * per_station_stages + per_session_stages)
+        # DICOM conversion is launched once with the full effective config.
+        if cfg.get("run_dicom_to_nifti", False):
+            stage_count += 1
+            total_weight += STAGE_WEIGHTS["dicom"]
+
+        per_station_multiplier = n_subjects * n_sessions * n_stations
+        for flag, stage_key in (
+            ("run_musclemap_dixon", "musclemap_dixon"),
+            ("run_totalseg", "totalseg"),
+            ("run_fat_compartments", "fat_compartments"),
+        ):
+            if cfg.get(flag):
+                stage_count += per_station_multiplier
+                total_weight += STAGE_WEIGHTS[stage_key] * per_station_multiplier
+
+        # T2-448 runs once per subject/session, not once per station.
+        if cfg.get("run_musclemap_t2_448"):
+            multiplier = n_subjects * n_sessions
+            stage_count += multiplier
+            total_weight += STAGE_WEIGHTS["musclemap_t2_448"] * multiplier
+
         if cfg.get("run_summary", True):
-            total += 1
-        return max(total, 1)
+            stage_count += 1
+            total_weight += STAGE_WEIGHTS["summary"]
+
+        return max(stage_count, 1), max(total_weight, 1.0)
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
@@ -541,13 +572,20 @@ class WholeBodySegGUI:
             messagebox.showerror("Cannot run", str(e))
             return
 
-        self.progress_total = self._estimate_total_steps(cfg)
+        self.progress_total, self.progress_total_weight = self._estimate_progress_plan(cfg)
         self.progress_completed = 0
+        self.progress_completed_weight = 0.0
+        self.progress_elapsed_at_last_completion = 0.0
+        self.completed_progress_events.clear()
+        self.current_stage_key = ""
+        self.current_stage_text = ""
+        self.current_stage_var.set("Current: starting pipeline...")
+        self.stop_requested = False
         self.run_start_time = time.time()
         self.progress_determinate = True
         self.progress.stop()
-        self.progress.config(mode="determinate", maximum=self.progress_total, value=0)
-        self.progress_label_var.set(f"0% (0/{self.progress_total} steps)")
+        self.progress.config(mode="determinate", maximum=self.progress_total_weight, value=0)
+        self.progress_label_var.set(f"0% (0/{self.progress_total} stages) — elapsed 0s, estimating time remaining...")
 
         RUN_CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -567,6 +605,7 @@ class WholeBodySegGUI:
         threading.Thread(target=self._run_subprocess, args=(cmd,), daemon=True).start()
 
     def _run_subprocess(self, cmd):
+        rc = -1
         try:
             self.proc = subprocess.Popen(
                 cmd,
@@ -585,10 +624,11 @@ class WholeBodySegGUI:
         finally:
             self.proc = None
             self.busy = False
-            self.log_queue.put(DONE_SENTINEL)
+            self.log_queue.put(("PROCESS_EXIT", rc))
 
     def _on_stop(self):
         if self.proc is not None:
+            self.stop_requested = True
             self._append_log("\n--- Stopping process (and any child processes it started) ---\n")
             try:
                 # WholeBodySeg.py spawns its own subprocesses (TotalSegmentator, mm_segment.py,
@@ -614,22 +654,108 @@ class WholeBodySegGUI:
             else:
                 self.progress.stop()
 
-    def _advance_progress(self):
-        self.progress_completed = min(self.progress_completed + 1, self.progress_total)
-        self.progress.config(value=self.progress_completed)
+    def _handle_progress_line(self, line: str) -> bool:
+        """Consume a machine-readable WholeBodySeg progress event."""
+        stripped = str(line).strip()
+        if not stripped.startswith(PROGRESS_PREFIX + "|"):
+            return False
+
+        parts = stripped.split("|", 6)
+        if len(parts) != 7:
+            return True
+
+        _prefix, event, stage_key, subject, session, station, label = parts
+        event = event.upper().strip()
+        stage_key = stage_key.strip()
+        label = label.strip() or stage_key
+        event_id = (stage_key, subject, session, station)
+
+        location = " | ".join(
+            part for part in (subject, session, station, label) if str(part).strip()
+        )
+        if event == "START":
+            self.current_stage_key = stage_key
+            self.current_stage_text = location or label
+            self.current_stage_var.set(f"Current: {self.current_stage_text}")
+            self._update_progress_display()
+        elif event == "DONE":
+            if event_id not in self.completed_progress_events:
+                self.completed_progress_events.add(event_id)
+                self.progress_completed = min(self.progress_completed + 1, self.progress_total)
+                self.progress_completed_weight = min(
+                    self.progress_completed_weight + STAGE_WEIGHTS.get(stage_key, 1.0),
+                    self.progress_total_weight,
+                )
+                if self.run_start_time is not None:
+                    self.progress_elapsed_at_last_completion = time.time() - self.run_start_time
+                self.progress.config(value=self.progress_completed_weight)
+            self._update_progress_display()
+
+        return True
+
+    def _update_progress_display(self):
+        if not self.progress_determinate or self.run_start_time is None:
+            return
 
         elapsed = time.time() - self.run_start_time
-        pct = int(100 * self.progress_completed / self.progress_total)
+        pct = int(round(100 * self.progress_completed_weight / self.progress_total_weight))
+        pct = min(100, max(0, pct))
+
         remaining_text = "estimating time remaining..."
-        if self.progress_completed > 0:
-            avg_per_step = elapsed / self.progress_completed
-            remaining = avg_per_step * (self.progress_total - self.progress_completed)
+        if self.progress_completed_weight > 0 and self.progress_elapsed_at_last_completion > 0:
+            seconds_per_weight = (
+                self.progress_elapsed_at_last_completion / self.progress_completed_weight
+            )
+            estimated_total = seconds_per_weight * self.progress_total_weight
+            remaining = max(0.0, estimated_total - elapsed)
             remaining_text = f"est. {self._format_duration(remaining)} remaining"
 
         self.progress_label_var.set(
-            f"{pct}% ({self.progress_completed}/{self.progress_total} steps) — "
+            f"{pct}% ({self.progress_completed}/{self.progress_total} stages) — "
             f"elapsed {self._format_duration(elapsed)}, {remaining_text}"
         )
+
+    def _update_progress_clock(self):
+        """Refresh elapsed time/ETA even while a long-running stage is active."""
+        if self.progress_determinate and self.busy and self.run_start_time is not None:
+            self._update_progress_display()
+        self.root.after(1000, self._update_progress_clock)
+
+    def _finish_pipeline_run(self, rc: int):
+        self._set_running(False)
+        elapsed = time.time() - self.run_start_time if self.run_start_time is not None else 0.0
+
+        if self.stop_requested:
+            self.status_var.set("Stopped")
+            self.current_stage_var.set(
+                f"Stopped during: {self.current_stage_text}" if self.current_stage_text else "Stopped"
+            )
+            self.progress_label_var.set(
+                f"{self.progress_completed}/{self.progress_total} stages — "
+                f"stopped after {self._format_duration(elapsed)}"
+            )
+            return
+
+        if rc == 0:
+            self.progress_completed = self.progress_total
+            self.progress_completed_weight = self.progress_total_weight
+            self.progress.config(value=self.progress_total_weight)
+            self.status_var.set("Completed successfully")
+            self.current_stage_var.set("Current: completed")
+            self.progress_label_var.set(
+                f"100% ({self.progress_total}/{self.progress_total} stages) — "
+                f"finished after {self._format_duration(elapsed)}"
+            )
+        else:
+            self.status_var.set(f"Failed (exit code {rc})")
+            if self.current_stage_text:
+                self.current_stage_var.set(f"Failed during: {self.current_stage_text}")
+            else:
+                self.current_stage_var.set("Current: failed before a stage started")
+            self.progress_label_var.set(
+                f"{self.progress_completed}/{self.progress_total} stages completed — "
+                f"failed after {self._format_duration(elapsed)}"
+            )
 
     # ------------------------------------------------------------------
     # Log widget helpers
@@ -650,19 +776,16 @@ class WholeBodySegGUI:
             while True:
                 item = self.log_queue.get_nowait()
                 if item is DONE_SENTINEL:
+                    # Used by environment setup, which intentionally has indeterminate progress.
                     self._set_running(False)
-                    if self.progress_determinate and self.run_start_time is not None:
-                        elapsed = time.time() - self.run_start_time
-                        self.progress_label_var.set(
-                            f"{self.progress_completed}/{self.progress_total} steps — "
-                            f"finished after {self._format_duration(elapsed)}"
-                        )
                 elif isinstance(item, tuple) and item[0] == "SET_INTERPRETER":
                     self.interpreter_var.set(item[1])
+                elif isinstance(item, tuple) and item[0] == "PROCESS_EXIT":
+                    self._finish_pipeline_run(int(item[1]))
                 else:
-                    self._append_log(item)
-                    if self.progress_determinate and any(marker in item for marker in STAGE_LOG_MARKERS):
-                        self._advance_progress()
+                    # Hide internal progress protocol lines from the visible log.
+                    if not self._handle_progress_line(item):
+                        self._append_log(item)
         except queue.Empty:
             pass
         self.root.after(100, self._poll_log_queue)

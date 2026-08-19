@@ -172,6 +172,16 @@ def dseg_name_for(map_filename: str) -> str:
     return map_filename + "_dseg.nii.gz"
 
 
+def musclemap_mask_name_for(map_filename: str) -> str:
+    """Return stable MuscleMap mask filename while preserving the T2 image basename."""
+    low = map_filename.lower()
+    if low.endswith(".nii.gz"):
+        return map_filename[:-7] + "_MuscleMap_Mask.nii.gz"
+    if low.endswith(".nii"):
+        return map_filename[:-4] + "_MuscleMap_Mask.nii"
+    return map_filename + "_MuscleMap_Mask.nii.gz"
+
+
 def should_reverse_slice_index(map_name: str) -> bool:
     """
     Reverse reported slice numbering for older GRAPPA-style outputs so CSV slice labels
@@ -185,7 +195,7 @@ def should_reverse_slice_index(map_name: str) -> bool:
 # ----------------------------
 # MUSCLEMAP SEGMENT RUNNER
 # ----------------------------
-def run_mm_segment(mm_segment_path: str, input_path: str):
+def run_mm_segment(mm_segment_path: str, input_path: str, model_version: str = "1.4"):
     """Run MuscleMap segmentation in the folder containing the input image."""
     input_path_obj = Path(input_path)
     run_dir = input_path_obj.parent
@@ -193,7 +203,8 @@ def run_mm_segment(mm_segment_path: str, input_path: str):
 
     cmd_str = (
         f'cd /d "{run_dir}" && '
-        f'"{sys.executable}" "{mm_segment_path}" -i "{input_name}"'
+        f'"{sys.executable}" "{mm_segment_path}" -i "{input_name}" '
+        f'--model_version "{model_version}"'
     )
 
     print("    Running:", cmd_str)
@@ -204,11 +215,19 @@ def run_mm_segment(mm_segment_path: str, input_path: str):
     env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     subprocess.run(cmd_str, check=True, shell=True, env=env)
 
-    expected = run_dir / dseg_name_for(input_name)
-    if not expected.exists():
+    # MuscleMap writes <input>_dseg.nii.gz. Normalize that output to the
+    # stable WholeBodySeg naming convention.
+    raw_expected = run_dir / dseg_name_for(input_name)
+    if not raw_expected.exists():
         stray = Path.cwd() / dseg_name_for(input_name)
         if stray.exists():
-            stray.replace(expected)
+            stray.replace(raw_expected)
+
+    final_mask = run_dir / musclemap_mask_name_for(input_name)
+    if raw_expected.exists() and raw_expected != final_mask:
+        if final_mask.exists():
+            final_mask.unlink()
+        raw_expected.replace(final_mask)
 
 
 # ----------------------------
@@ -500,6 +519,7 @@ def main():
     ap.add_argument("--musclemap_repo", default=DEFAULT_MUSCLEMAP_REPO, help="Path to MuscleMap repo")
     ap.add_argument("--skip_seg", action="store_true", help="Skip segmentation step")
     ap.add_argument("--skip_metrics", action="store_true", help="Skip native metrics step")
+    ap.add_argument("--model_version", default="1.4", help="MuscleMap whole-body model version (default: 1.4)")
     ap.add_argument("--thigh", default="", help="Optional explicit thigh T2 image filename")
     ap.add_argument("--calf", default="", help="Optional explicit calf T2 image filename")
     args = ap.parse_args()
@@ -557,15 +577,15 @@ def main():
             if not fn:
                 continue
             map_path = os.path.join(base_dir, fn)
-            seg_fn = dseg_name_for(fn)
+            seg_fn = musclemap_mask_name_for(fn)
             seg_path = os.path.join(base_dir, seg_fn)
 
             if os.path.isfile(seg_path):
-                print(f"[SKIP] {map_name}: dseg exists ({seg_fn})")
+                print(f"[SKIP] {map_name}: MuscleMap mask exists ({seg_fn})")
                 continue
 
             print(f"[SEG ] {map_name}: {fn}")
-            run_mm_segment(mm_segment_path, map_path)
+            run_mm_segment(mm_segment_path, map_path, model_version=args.model_version)
 
     if not args.skip_metrics:
         print("\n--- STEP 2: T2-448 Native Metrics ---")
@@ -573,11 +593,11 @@ def main():
             if not fn:
                 continue
             map_path = os.path.join(base_dir, fn)
-            seg_fn = dseg_name_for(fn)
+            seg_fn = musclemap_mask_name_for(fn)
             seg_path = os.path.join(base_dir, seg_fn)
 
             if not os.path.isfile(seg_path):
-                print(f"!! Missing dseg for {map_name}: {seg_fn} (segmentation step failed or was skipped)")
+                print(f"!! Missing MuscleMap mask for {map_name}: {seg_fn} (segmentation step failed or was skipped)")
                 continue
 
             print(f"[MET ] {map_name}: {fn}")
@@ -636,6 +656,7 @@ def run_musclemap_t2_448(station_dir, cfg):
         "--dir", str(t2_dir),
         "--code_dir", cfg.get("code_dir", str(Path.cwd())),
         "--musclemap_repo", cfg.get("musclemap_repo", str(Path.cwd() / "MuscleMap")),
+        "--model_version", str(cfg.get("musclemap_model_version", "1.4")),
     ]
 
     if thigh_name:

@@ -14,6 +14,28 @@ except Exception:
     build_wholebodyseg_summary = None
 
 
+PROGRESS_PREFIX = "[WBS_PROGRESS]"
+
+
+def emit_progress(event: str, stage_key: str, subject: str = "", session: str = "", station: str = "", label: str = ""):
+    """Emit a machine-readable progress event for the GUI."""
+    clean = lambda value: str(value or "").replace("|", "/").replace("\n", " ").strip()
+    print(
+        "|".join(
+            [
+                PROGRESS_PREFIX,
+                clean(event).upper(),
+                clean(stage_key),
+                clean(subject),
+                clean(session),
+                clean(station),
+                clean(label),
+            ]
+        ),
+        flush=True,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="WholeBodySeg")
     parser.add_argument("--config", required=True, help="Path to config JSON file")
@@ -35,7 +57,9 @@ def main():
 
     if cfg.get("run_dicom_to_nifti", False):
         print("\n=== DICOM -> NIfTI Conversion ===")
+        emit_progress("START", "dicom", label="DICOM -> NIfTI")
         run_dicom_to_nifti(cfg)
+        emit_progress("DONE", "dicom", label="DICOM -> NIfTI")
 
     data_root = Path(cfg["data_root"])
     subjects = cfg.get("subjects", [])
@@ -100,19 +124,25 @@ def main():
 
                 if cfg.get("run_musclemap_dixon", True):
                     print("\n=== MuscleMap Dixon ===")
+                    emit_progress("START", "musclemap_dixon", subject, session_label, station, "MuscleMap Dixon")
                     run_musclemap_dixon(station_dir, cfg)
+                    emit_progress("DONE", "musclemap_dixon", subject, session_label, station, "MuscleMap Dixon")
                 else:
                     print("\nSkipping MuscleMap Dixon")
 
                 if cfg.get("run_totalseg", True):
                     print("\n=== TotalSegmentator ===")
+                    emit_progress("START", "totalseg", subject, session_label, station, "TotalSegmentator")
                     run_totalseg(station_dir, cfg)
+                    emit_progress("DONE", "totalseg", subject, session_label, station, "TotalSegmentator")
                 else:
                     print("\nSkipping TotalSegmentator because run_totalseg is false")
 
                 if cfg.get("run_fat_compartments", False):
                     print("\n=== Fat compartments ===")
+                    emit_progress("START", "fat_compartments", subject, session_label, station, "Fat compartments")
                     run_fat_compartments(station_dir, cfg)
+                    emit_progress("DONE", "fat_compartments", subject, session_label, station, "Fat compartments")
                 else:
                     print("\nSkipping fat compartments")
 
@@ -126,16 +156,20 @@ def main():
                     else:
                         cfg[t2_key] = True
                         print("\n=== MuscleMap T2-448 ===")
+                        emit_progress("START", "musclemap_t2_448", subject, session_label, "", "MuscleMap T2-448")
                         run_musclemap_t2_448(station_dir, cfg)
+                        emit_progress("DONE", "musclemap_t2_448", subject, session_label, "", "MuscleMap T2-448")
                 else:
                     print("\nSkipping MuscleMap T2-448")
 
     if cfg.get("run_summary", True):
         print("\n=== WholeBodySeg summary CSVs ===")
+        emit_progress("START", "summary", label="WholeBodySeg summary CSVs")
         if build_wholebodyseg_summary is None:
             print("WARNING: scripts/build_wholebodyseg_summary.py could not be imported; summary skipped.")
         else:
             build_wholebodyseg_summary(config_path)
+        emit_progress("DONE", "summary", label="WholeBodySeg summary CSVs")
     else:
         print("\nSkipping WholeBodySeg summary CSVs")
 

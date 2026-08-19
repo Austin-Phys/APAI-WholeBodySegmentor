@@ -43,20 +43,32 @@ def dseg_name_for(fn: str) -> str:
     return fn + "_dseg.nii.gz"
 
 
-def run_mm_segment(mm_segment_path: str, input_path: str):
+def musclemap_mask_name_for_dixon() -> str:
+    """Stable WholeBodySeg output name for the Dixon MuscleMap segmentation."""
+    return "Dixon_MuscleMap_Mask.nii.gz"
+
+
+def run_mm_segment(mm_segment_path: str, input_path: str, model_version: str = "1.4"):
     """
     Run MuscleMap segmentation with the working directory set to the folder
     containing the input image.
 
-    Newer MuscleMap/mm_segment versions save Dixon_W_COMP_dseg.nii.gz into the
+    MuscleMap/mm_segment writes a temporary <input>_dseg.nii.gz into the
     current working directory rather than beside the input file unless cwd is set.
     Setting cwd here keeps the segmentation output inside the station/session
-    folder, e.g. Musclemap Data/Upper or Musclemap Data/Lower.
+    folder; WholeBodySeg then renames it to Dixon_MuscleMap_Mask.nii.gz.
     """
     input_path_obj = Path(input_path)
     run_dir = input_path_obj.parent
 
-    cmd = [sys.executable, mm_segment_path, "-i", str(input_path_obj)]
+    cmd = [
+        sys.executable,
+        mm_segment_path,
+        "-i",
+        str(input_path_obj),
+        "--model_version",
+        str(model_version),
+    ]
     env = os.environ.copy()
     # Anaconda's MKL numpy and pip-installed torch both ship libiomp5md.dll,
     # which aborts the OpenMP runtime on import ("OMP: Error #15") unless
@@ -64,13 +76,19 @@ def run_mm_segment(mm_segment_path: str, input_path: str):
     env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     subprocess.run(cmd, check=True, cwd=str(run_dir), env=env)
 
-    # Defensive fallback: if mm_segment still writes into the caller/code directory,
-    # move the expected dseg file back beside the input.
-    expected = run_dir / dseg_name_for(input_path_obj.name)
-    if not expected.exists():
+    # MuscleMap itself writes <input>_dseg.nii.gz. Normalize that raw output to
+    # the stable WholeBodySeg filename used downstream.
+    raw_expected = run_dir / dseg_name_for(input_path_obj.name)
+    if not raw_expected.exists():
         stray = Path.cwd() / dseg_name_for(input_path_obj.name)
         if stray.exists():
-            stray.replace(expected)
+            stray.replace(raw_expected)
+
+    final_mask = run_dir / musclemap_mask_name_for_dixon()
+    if raw_expected.exists() and raw_expected != final_mask:
+        if final_mask.exists():
+            final_mask.unlink()
+        raw_expected.replace(final_mask)
 
 
 def summarize(vals: np.ndarray):
@@ -348,6 +366,7 @@ def main():
     ap.add_argument("--code_dir", required=True)
     ap.add_argument("--musclemap_repo", default=DEFAULT_MUSCLEMAP_REPO, help="Path to MuscleMap repo")
     ap.add_argument("--skip_seg", action="store_true")
+    ap.add_argument("--model_version", default="1.4", help="MuscleMap whole-body model version (default: 1.4)")
     ap.add_argument("--signal_threshold", type=float, default=50.0)
     ap.add_argument("--erode_voxels", type=int, default=1)
     args = ap.parse_args()
@@ -368,11 +387,11 @@ def main():
     f_fn = f_files[0]
     w_path = os.path.join(base, w_fn)
     f_path = os.path.join(base, f_fn)
-    seg_path = os.path.join(base, dseg_name_for(w_fn))
+    seg_path = os.path.join(base, musclemap_mask_name_for_dixon())
 
     if not args.skip_seg and not os.path.exists(seg_path):
         print("Running segmentation on Dixon W")
-        run_mm_segment(mm_segment, w_path)
+        run_mm_segment(mm_segment, w_path, model_version=args.model_version)
 
     if not os.path.exists(seg_path):
         raise FileNotFoundError(f"Missing segmentation: {seg_path}")
@@ -381,10 +400,8 @@ def main():
     print("Creating FF map")
     create_ff(w_path, f_path, ff_path, signal_threshold=args.signal_threshold)
 
-    qc_dir = os.path.join(base, "eroded_mask_for_qc")
-    os.makedirs(qc_dir, exist_ok=True)
-
-    eroded_seg_path = os.path.join(qc_dir, "Dixon_W_COMP_eroded_dseg.nii.gz")
+    # Keep the eroded MuscleMap mask beside the full mask in the station folder.
+    eroded_seg_path = os.path.join(base, "Dixon_MuscleMap_Mask_eroded.nii.gz")
 
     print("Building eroded muscle segmentation")
     seg_img = nib.load(seg_path)
@@ -415,6 +432,7 @@ def run_musclemap_dixon(station_dir, cfg):
         "--dir", str(station_dir),
         "--code_dir", cfg.get("code_dir", str(Path.cwd())),
         "--musclemap_repo", cfg.get("musclemap_repo", str(Path.cwd() / "MuscleMap")),
+        "--model_version", str(cfg.get("musclemap_model_version", "1.4")),
         "--signal_threshold", str(cfg.get("signal_threshold", 50.0)),
         "--erode_voxels", str(cfg.get("erode_voxels", 1)),
     ]

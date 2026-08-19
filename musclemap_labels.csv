@@ -31,16 +31,16 @@ label_id,region,anatomy,side
 5122,abdomen,psoas major,right
 5131,abdomen,quadratus lumborum,left
 5132,abdomen,quadratus lumborum,right
-5141,abdomen,lattisimus dorsi,left
-5142,abdomen,lattisimus dorsi,right
+5141,abdomen,latissimus dorsi,left
+5142,abdomen,latissimus dorsi,right
 6101,pelvis,gluteus minimus,left
 6102,pelvis,gluteus minimus,right
 6111,pelvis,gluteus medius,left
 6112,pelvis,gluteus medius,right
 6121,pelvis,gluteus maximus,left
 6122,pelvis,gluteus maximus,right
-6131,pelvis,tensor fascia latae,left
-6132,pelvis,tensor fascia latae,right
+6131,pelvis,tensor fasciae latae,left
+6132,pelvis,tensor fasciae latae,right
 6141,pelvis,iliacus,left
 6142,pelvis,iliacus,right
 6151,pelvis,ilium,left
@@ -84,17 +84,31 @@ label_id,region,anatomy,side
 7212,thigh,adductor longus,right
 7221,thigh,adductor brevis,left
 7222,thigh,adductor brevis,right
-8101,leg,anterior compartment,left
-8102,leg,anterior compartment,right
-8111,leg,deep posterior compartment,left
-8112,leg,deep posterior compartment,right
-8121,leg,lateral compartment,left
-8122,leg,lateral compartment,right
+7231,thigh,patella,left
+7232,thigh,patella,right
+8101,leg,tibialis anterior,left
+8102,leg,tibialis anterior,right
+8111,leg,tibialis posterior,left
+8112,leg,tibialis posterior,right
+8121,leg,peroneus longus,left
+8122,leg,peroneus longus,right
 8131,leg,soleus,left
 8132,leg,soleus,right
-8141,leg,gastrocnemius,left
-8142,leg,gastrocnemius,right
-8151,leg,tibia,left
-8152,leg,tibia,right
-8161,leg,fibula,left
-8162,leg,fibula,right
+8141,leg,medial gastrocnemius,left
+8142,leg,medial gastrocnemius,right
+8151,leg,lateral gastrocnemius,left
+8152,leg,lateral gastrocnemius,right
+8161,leg,tibia,left
+8162,leg,tibia,right
+8171,leg,fibula,left
+8172,leg,fibula,right
+8181,leg,flexor hallucis longus,left
+8182,leg,flexor hallucis longus,right
+8191,leg,extensor digitorum longus,left
+8192,leg,extensor digitorum longus,right
+8201,leg,flexor digitorum longus,left
+8202,leg,flexor digitorum longus,right
+8211,leg,popliteus,left
+8212,leg,popliteus,right
+8221,leg,plantaris,left
+8222,leg,plantaris,right

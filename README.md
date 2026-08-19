@@ -1,6 +1,6 @@
 # WholeBodySeg
 
-A pipeline for processing whole-body MRI studies: converting DICOM to NIfTI, running muscle/fat segmentation (via [MuscleMap](https://github.com/MuscleMap/MuscleMap) and TotalSegmentator), computing fat-compartment metrics, and building summary tables — driven by a config file or a Tkinter GUI.
+A pipeline for processing whole-body MRI studies: converting DICOM to NIfTI, running muscle/fat segmentation (via [MuscleMap](https://github.com/MuscleMap/MuscleMap) and [TotalSegmentator](https://github.com/wasserth/TotalSegmentator), computing fat-compartment metrics, and building summary tables — driven by a config file or a Tkinter GUI.
 
 ## Features
 

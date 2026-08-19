@@ -17,9 +17,9 @@ This replaces the earlier ultra-wide station/subject summary approach.
 Expected inputs, when available:
   Station-level:
     <subject>_Dixon_FF_volume.csv
-    <subject>_SAT_volume.csv
-    <subject>_IMAT_volume.csv
-    <subject>_VAT_volume.csv
+    fat compartment csvs/<subject>_SAT_volume.csv
+    fat compartment csvs/<subject>_IMAT_volume.csv
+    fat compartment csvs/<subject>_VAT_volume.csv
     TotalSegmentator_FF_volume_metrics_eroded1.csv
 
   Session-level:
@@ -30,7 +30,7 @@ Metric conventions:
   Dixon-derived generic "mean" -> mean_FF
   Fat compartment generic "mean" -> mean_FF
   TotalSegmentator FF metrics -> mean_FF, volume_ml, etc.
-  T2-derived generic "mean" -> mean_T2
+  T2 summary output -> volume_ml and n_voxels only
 
 Regional rollups use volume-weighted means within each station/session only:
   sum(mean * volume_ml) / sum(volume_ml)
@@ -301,8 +301,21 @@ def collect_musclemap_dixon(rows: List[Dict[str, object]], station_dir: Path, su
 
 
 def collect_fat_compartments(rows: List[Dict[str, object]], station_dir: Path, subject: str, session: str, station: str):
+    # Current fat-compartment metrics are written into a dedicated station-level
+    # subfolder rather than directly into the Upper/Lower station directory.
+    fat_csv_dir = station_dir / "fat compartment csvs"
+
+    # Prefer the current dedicated CSV folder, but keep a station-root fallback
+    # for compatibility with older already-processed datasets.
+    search_dirs = [fat_csv_dir, station_dir]
+
     for comp in ["SAT", "IMAT", "VAT"]:
-        p = first_existing(station_dir, [f"{subject}*_{comp}_volume.csv", f"*_{comp}_volume.csv"])
+        p = None
+        for folder in search_dirs:
+            p = first_existing(folder, [f"{subject}*_{comp}_volume.csv", f"*_{comp}_volume.csv"])
+            if p is not None:
+                break
+
         df = read_csv_optional(p)
         if df is None or df.empty:
             continue
@@ -346,8 +359,6 @@ def collect_totalseg(rows: List[Dict[str, object]], station_dir: Path, subject: 
             "mean_ff_fraction_eroded_mask": ("mean_FF", "fraction"),
             "median_ff_fraction_eroded_mask": ("median_FF", "fraction"),
             "sd_ff_fraction_eroded_mask": ("std_FF", "fraction"),
-            "p05_ff_fraction_eroded_mask": ("p05_FF", "fraction"),
-            "p95_ff_fraction_eroded_mask": ("p95_FF", "fraction"),
             "fat_volume_ml_full_volume_x_eroded_mean_ff": ("fat_volume_ml", "mL"),
         }
 
@@ -381,13 +392,6 @@ def collect_t2(rows: List[Dict[str, object]], session_dir: Path, subject: str, s
             metric_map = {
                 "n_voxels": ("n_voxels", "voxels"),
                 "volume_ml": ("volume_ml", "mL"),
-                "mean": ("mean_T2", "a.u."),
-                "median": ("median_T2", "a.u."),
-                "std": ("std_T2", "a.u."),
-                "p05": ("p05_T2", "a.u."),
-                "p95": ("p95_T2", "a.u."),
-                "min": ("min_T2", "a.u."),
-                "max": ("max_T2", "a.u."),
             }
 
             for col, (metric, units) in metric_map.items():
@@ -502,15 +506,11 @@ def build_rollups(long_df: pd.DataFrame) -> pd.DataFrame:
             for side, ssdf in gdf.groupby("side", dropna=False):
                 group_name = group if clean_text(side) in {"", "unknown"} else f"{group}_{clean_text(side)}"
                 vol = sum_value(ssdf, "volume_ml")
-                mean_t2 = weighted_mean(ssdf, "mean_T2", "volume_ml")
                 nvox = sum_value(ssdf, "n_voxels")
 
                 if vol is not None:
                     append_rollup_metric(rows, subject, session, "", "MM_T2", group_name,
                                          "volume_ml", vol, "mL", "volume sum")
-                if mean_t2 is not None:
-                    append_rollup_metric(rows, subject, session, "", "MM_T2", group_name,
-                                         "mean_T2", mean_t2, "a.u.", "volume-weighted")
                 if nvox is not None:
                     append_rollup_metric(rows, subject, session, "", "MM_T2", group_name,
                                          "n_voxels", nvox, "voxels", "voxel sum")

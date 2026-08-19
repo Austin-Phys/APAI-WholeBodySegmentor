@@ -7,8 +7,8 @@ WholeBodySeg fat compartment module.
 Runs after:
   1. musclemap_dixon_pipeline.py
      - Dixon_FF_map.nii.gz
-     - Dixon_W_COMP_dseg.nii.gz
-     - eroded_mask_for_qc/Dixon_W_COMP_eroded_dseg.nii.gz
+     - Dixon_MuscleMap_Mask.nii.gz
+     - Dixon_MuscleMap_Mask_eroded.nii.gz
   2. totalseg_pipeline.py
      - TotalSegmentator outputs for future organ/anatomy exclusions
 
@@ -111,7 +111,7 @@ def find_required_dixon_inputs(base: str):
     w_path = os.path.join(base, w_fn)
     f_path = os.path.join(base, f_fn)
     ff_path = os.path.join(base, "Dixon_FF_map.nii.gz")
-    seg_path = os.path.join(base, dseg_name_for(w_fn))
+    seg_path = os.path.join(base, "Dixon_MuscleMap_Mask.nii.gz")
 
     if not os.path.exists(ff_path):
         raise FileNotFoundError(f"Missing FF map. Run musclemap_dixon_pipeline first: {ff_path}")
@@ -127,7 +127,7 @@ def load_total_segmentator_mask(base: str, reference_shape):
 
     Returns an all-False mask if TotalSeg output is missing or does not match the Dixon grid.
     """
-    label_path = Path(base) / "TotalSegmentator_nonMuscleMap_labels.nii.gz"
+    label_path = Path(base) / "TS_Organs_Mask.nii.gz"
 
     if not label_path.exists():
         print("    NOTE: TotalSeg combined label map not found; VAT/SAT correction will use non-TotalSeg logic only.")
@@ -159,8 +159,8 @@ def load_total_segmentator_labels(base: str, reference_shape):
       labels_img: int ndarray, same shape as Dixon, or zeros if unavailable
       label_name_to_id: dict name -> integer label ID
     """
-    label_path = Path(base) / "TotalSegmentator_nonMuscleMap_labels.nii.gz"
-    csv_path = Path(base) / "TotalSegmentator_nonMuscleMap_labels.csv"
+    label_path = Path(base) / "TS_Organs_Mask.nii.gz"
+    csv_path = Path(base) / "TS_Organs_Mask.csv"
 
     if not label_path.exists() or not csv_path.exists():
         return np.zeros(reference_shape, dtype=np.int32), {}
@@ -367,15 +367,15 @@ def load_totalseg_named_anatomy_exclusion(
     reference_shape,
     folder_names=None,
     include_terms=None,
-    eroded_label_filename: str = "TotalSegmentator_nonMuscleMap_labels_eroded1.nii.gz",
+    eroded_label_filename: str = "TS_Organs_Mask_eroded1.nii.gz",
 ) -> np.ndarray:
     """
     Load organ/bone/anatomy masks that should be excluded from thoracic fat labels.
 
     Preferred behavior:
       - Use the precomputed eroded TotalSegmentator label map located directly
-        in the station folder: TotalSegmentator_nonMuscleMap_labels_eroded1.nii.gz
-      - Use TotalSegmentator_nonMuscleMap_labels.csv as the lookup table.
+        in the station folder: TS_Organs_Mask_eroded1.nii.gz
+      - Use TS_Organs_Mask.csv as the lookup table.
 
     This prevents thoracic trunk fat from counting lung, heart, spine/vertebrae,
     ribs/sternum, aorta, esophagus, trachea/bronchi, and similar non-fat anatomy,
@@ -397,10 +397,10 @@ def load_totalseg_named_anatomy_exclusion(
 
     # 1) Preferred: use precomputed eroded combined label map in the station folder.
     # The CSV label table remains the same as the full combined label map.
-    csv_path = base / "TotalSegmentator_nonMuscleMap_labels.csv"
+    csv_path = base / "TS_Organs_Mask.csv"
     preferred_label_paths = [
         base / eroded_label_filename,
-        base / "TotalSegmentator_nonMuscleMap_labels.nii.gz",
+        base / "TS_Organs_Mask.nii.gz",
     ]
 
     for label_path in preferred_label_paths:
@@ -626,6 +626,42 @@ def load_totalseg_subcutaneous_fat(
 
     print(f"    NOTE: TotalSeg subcutaneous_fat mask not found in {folder}; using computed SAT fallback.")
     return np.zeros(reference_shape, dtype=bool)
+
+
+
+def load_totalseg_vertebrae_mr(
+    base: str,
+    reference_shape,
+    folder_name: str = "TS_VERTEBRAE_MR",
+    combined_filename: str = "VertebraeMR_labels.nii.gz",
+) -> np.ndarray:
+    """Prefer combined vertebrae_mr label map; fall back to separate masks."""
+    base = Path(base)
+    combined_path = base / combined_filename
+    if combined_path.exists():
+        img = nib.load(str(combined_path))
+        arr = np.rint(img.get_fdata()).astype(np.int32)
+        if arr.shape == tuple(reference_shape):
+            mask = arr > 0
+            if np.any(mask):
+                print(f"    Using combined TotalSeg vertebrae_mr exclusion map: {combined_path}")
+                return mask
+
+    folder = base / folder_name
+    if not folder.exists():
+        return np.zeros(reference_shape, dtype=bool)
+
+    combined = np.zeros(reference_shape, dtype=bool)
+    used = 0
+    for p in sorted(list(folder.glob("*.nii.gz")) + list(folder.glob("*.nii"))):
+        m = _load_binary_nifti_mask(p, reference_shape, label=f"TotalSeg vertebrae_mr {p.name}")
+        if np.any(m):
+            combined |= m
+            used += 1
+
+    if used:
+        print(f"    Using {used} separate vertebrae_mr masks as exclusion fallback.")
+    return combined
 
 
 def load_totalseg_abdominal_muscles(
@@ -1027,6 +1063,245 @@ def recover_upper_sat_mask(
     return final_sat, additions, surface_seed
 
 
+
+def recover_upper_sat_mask_local(
+    sat_seed: np.ndarray,
+    fat_candidate_sat: np.ndarray,
+    signal: np.ndarray,
+    muscle_exclusion: np.ndarray,
+    vat_mask: np.ndarray,
+    voxel_spacing,
+    max_iterations: int = 3,
+    close_mm: float = 2.0,
+):
+    """
+    Conservative Upper-only SAT gap recovery.
+
+    TotalSegmentator tissue_types_mr/subcutaneous_fat remains the anatomical
+    classifier. Dixon FF is only allowed to fill nearby missed SAT voxels.
+
+    Differences from the previous Upper SAT recovery:
+      - no body-surface seed
+      - no surface band
+      - no long-range propagation
+      - growth starts only from the TotalSegmentator SAT mask
+      - growth is in-plane only (3x3x1)
+      - recovered voxels must satisfy the Dixon fat candidate mask
+      - muscle and VAT remain excluded
+    """
+    sat_seed = sat_seed.astype(bool)
+
+    allowed = (
+        fat_candidate_sat.astype(bool)
+        & signal.astype(bool)
+        & (~muscle_exclusion.astype(bool))
+        & (~vat_mask.astype(bool))
+    )
+
+    # Preserve the trusted TotalSegmentator seed. Only NEW voxels must satisfy
+    # the Dixon-based allowed mask.
+    grown = sat_seed.copy()
+    structure = np.ones((3, 3, 1), dtype=bool)
+
+    for _ in range(max(0, int(max_iterations))):
+        adjacent = ndi.binary_dilation(grown, structure=structure)
+        additions = adjacent & allowed & (~grown)
+        if not np.any(additions):
+            break
+        grown |= additions
+
+    # Small closing bridges tiny discontinuities, while restricting any newly
+    # introduced voxels to the same allowed Dixon-fat domain.
+    if float(close_mm) > 0:
+        close_structure = _ellipsoid_structure_mm(close_mm, voxel_spacing)
+        closed = ndi.binary_closing(grown, structure=close_structure)
+        grown |= (closed & allowed)
+
+    final_sat = grown & (~vat_mask.astype(bool))
+    recovered_additions = final_sat & (~sat_seed)
+    return final_sat, recovered_additions
+
+
+
+
+
+def recover_lower_sat_mask_local(
+    sat_seed: np.ndarray,
+    fat_candidate_sat: np.ndarray,
+    signal: np.ndarray,
+    fascia_mask: np.ndarray,
+    muscle_exclusion: np.ndarray,
+    vat_mask: np.ndarray,
+    voxel_spacing,
+    max_iterations: int = 3,
+    close_mm: float = 2.0,
+):
+    """Conservative Lower-station SAT recovery constrained outside fascia."""
+    sat_seed = sat_seed.astype(bool)
+    allowed = (
+        fat_candidate_sat.astype(bool)
+        & signal.astype(bool)
+        & (~fascia_mask.astype(bool))
+        & (~muscle_exclusion.astype(bool))
+        & (~vat_mask.astype(bool))
+    )
+
+    grown = sat_seed.copy()
+    structure = np.ones((3, 3, 1), dtype=bool)
+    for _ in range(max(0, int(max_iterations))):
+        adjacent = ndi.binary_dilation(grown, structure=structure)
+        additions = adjacent & allowed & (~grown)
+        if not np.any(additions):
+            break
+        grown |= additions
+
+    if float(close_mm) > 0:
+        close_structure = _ellipsoid_structure_mm(close_mm, voxel_spacing)
+        closed = ndi.binary_closing(grown, structure=close_structure)
+        grown |= (closed & allowed)
+
+    final_sat = grown & (~vat_mask.astype(bool))
+    return final_sat, final_sat & (~sat_seed)
+
+
+def fill_small_upper_sat_holes(
+    sat_mask: np.ndarray,
+    allowed_mask: np.ndarray,
+    voxel_spacing,
+    max_hole_ml: float = 10.0,
+    close_mm: float = 4.0,
+) -> tuple:
+    """
+    Conservative Upper SAT local-gap fill.
+
+    Unlike binary_fill_holes, this does NOT regard the whole thoracic/abdominal
+    interior as a hole. It performs a small in-plane morphological closing of the
+    existing SAT mask and only accepts newly bridged voxels that are also inside
+    the explicitly allowed fat domain.
+
+    Connected additions larger than max_hole_ml are rejected.
+
+    Returns:
+      final_sat, gaps_added
+    """
+    sat = sat_mask.astype(bool).copy()
+    allowed = allowed_mask.astype(bool)
+    additions = np.zeros_like(sat, dtype=bool)
+
+    spacing_xy = np.asarray(voxel_spacing[:2], dtype=float)
+    spacing_xy[spacing_xy <= 0] = 1.0
+    radius_mm = max(0.0, float(close_mm))
+
+    if radius_mm <= 0:
+        return sat, additions
+
+    rx = max(1, int(np.ceil(radius_mm / spacing_xy[0])))
+    ry = max(1, int(np.ceil(radius_mm / spacing_xy[1])))
+    gx, gy = np.ogrid[-rx:rx + 1, -ry:ry + 1]
+    structure2d = (
+        (gx * spacing_xy[0]) ** 2 +
+        (gy * spacing_xy[1]) ** 2
+    ) <= (radius_mm ** 2 + 1e-6)
+
+    for z in range(sat.shape[2]):
+        sl = sat[:, :, z]
+        if not np.any(sl):
+            continue
+        closed = ndi.binary_closing(sl, structure=structure2d)
+        additions[:, :, z] = closed & (~sl) & allowed[:, :, z]
+
+    voxel_volume_ml = float(np.prod(np.asarray(voxel_spacing[:3], dtype=float))) / 1000.0
+    max_voxels = max(1, int(round(float(max_hole_ml) / max(voxel_volume_ml, 1e-12))))
+
+    keep = np.zeros_like(additions, dtype=bool)
+    structure2d_conn = np.ones((3, 3), dtype=bool)
+
+    for z in range(additions.shape[2]):
+        add_slice = additions[:, :, z]
+        if not np.any(add_slice):
+            continue
+        lab2d, n2d = ndi.label(add_slice, structure=structure2d_conn)
+        if n2d == 0:
+            continue
+        counts = np.bincount(lab2d.ravel())
+        for component_id in range(1, n2d + 1):
+            if counts[component_id] <= max_voxels:
+                keep[:, :, z] |= (lab2d == component_id)
+
+    return sat | keep, keep
+
+
+def build_upper_trunk_support_mask(
+    signal: np.ndarray,
+    trunk_anchor: np.ndarray,
+    erode_voxels: int = 4,
+) -> np.ndarray:
+    """
+    Build an Upper-station torso support mask that excludes the lateral arms.
+
+    Strategy:
+      1. Build the filled body mask slice-by-slice.
+      2. Erode the body in-plane to separate arms from the torso at the axilla.
+      3. Keep the eroded connected component that overlaps the internal
+         thoracic/abdominal cavity anchor.
+      4. Dilate that torso core back by the same amount and intersect with body.
+
+    If no cavity anchor is present on a slice, the largest eroded component is
+    used as a conservative fallback.
+    """
+    body = _filled_body_mask_inplane(signal)
+    support = np.zeros_like(body, dtype=bool)
+    erode_voxels = max(0, int(erode_voxels))
+    structure = np.ones((3, 3), dtype=bool)
+
+    for z in range(body.shape[2]):
+        b = body[:, :, z]
+        if not np.any(b):
+            continue
+
+        core = b.copy()
+        if erode_voxels > 0:
+            core = ndi.binary_erosion(
+                core,
+                structure=structure,
+                iterations=erode_voxels,
+                border_value=0,
+            )
+
+        if not np.any(core):
+            support[:, :, z] = b
+            continue
+
+        labels, n = ndi.label(core)
+        if n == 0:
+            support[:, :, z] = b
+            continue
+
+        anchor = trunk_anchor[:, :, z].astype(bool) & core
+        anchor_labels = np.unique(labels[anchor])
+        anchor_labels = anchor_labels[anchor_labels > 0]
+
+        if anchor_labels.size > 0:
+            torso_core = np.isin(labels, anchor_labels)
+        else:
+            counts = np.bincount(labels.ravel())
+            counts[0] = 0
+            torso_core = labels == int(np.argmax(counts))
+
+        torso = torso_core
+        if erode_voxels > 0:
+            torso = ndi.binary_dilation(
+                torso,
+                structure=structure,
+                iterations=erode_voxels,
+            )
+
+        support[:, :, z] = torso & b
+
+    return support
+
+
+
 def build_sat_imat_masks(
     water_path: str,
     fat_path: str,
@@ -1072,9 +1347,28 @@ def build_sat_imat_masks(
     sat_surface_band_mm: float = 15.0,
     sat_recovery_close_mm: float = 5.0,
     sat_recovery_min_component_ml: float = 2.0,
+    upper_sat_recovery_ff_threshold: float = 0.20,
+    upper_sat_fill_holes: bool = True,
+    upper_sat_max_hole_ml: float = 10.0,
+    upper_sat_gap_fill_close_mm: float = 4.0,
+    upper_sat_remove_arms: bool = True,
+    upper_sat_trunk_erode_voxels: int = 4,
+    lower_sat_recovery_enabled: bool = True,
+    lower_sat_recovery_ff_threshold: float = 0.20,
+    lower_sat_recovery_iterations: int = 3,
+    lower_sat_recovery_close_mm: float = 2.0,
+    lower_sat_fill_holes: bool = True,
+    lower_sat_max_hole_ml: float = 5.0,
+    lower_sat_gap_fill_close_mm: float = 4.0,
+    use_totalseg_vertebrae_mr_exclusion: bool = True,
+    totalseg_vertebrae_mr_folder: str = "TS_VERTEBRAE_MR",
+    vertebrae_mr_exclusion_mask_out: str = None,
     sat_seed_mask_out: str = None,
     sat_recovery_added_mask_out: str = None,
     sat_surface_seed_mask_out: str = None,
+    sat_before_hole_fill_mask_out: str = None,
+    sat_holes_filled_mask_out: str = None,
+    sat_arm_exclusion_mask_out: str = None,
 ):
     w_img = nib.load(water_path)
     f_img = nib.load(fat_path)
@@ -1172,9 +1466,19 @@ def build_sat_imat_masks(
 
     abdominal_muscle_exclusion = abdominal_muscle_mask.astype(bool)
 
+    station_is_upper = str(station_name).strip().lower() == "upper"
+    vertebrae_mr_exclusion = np.zeros_like(signal, dtype=bool)
+    if station_is_upper and use_totalseg_exclusions and use_totalseg_vertebrae_mr_exclusion:
+        vertebrae_mr_exclusion = load_totalseg_vertebrae_mr(
+            base_dir or os.path.dirname(ff_path),
+            signal.shape,
+            folder_name=totalseg_vertebrae_mr_folder,
+        )
+
     fat_candidate_imat = signal & np.isfinite(ff) & (ff >= fat_ff_threshold_imat) & (~exclusion) & (~abdominal_muscle_exclusion)
-    fat_candidate_sat = signal & np.isfinite(ff) & (ff >= fat_ff_threshold_sat) & (~exclusion) & (~abdominal_muscle_exclusion)
-    fat_candidate_vat = signal & np.isfinite(ff) & (ff >= fat_ff_threshold_vat) & (~exclusion) & (~abdominal_muscle_exclusion)
+    sat_vat_bone_exclusion = vertebrae_mr_exclusion if station_is_upper else np.zeros_like(signal, dtype=bool)
+    fat_candidate_sat = signal & np.isfinite(ff) & (ff >= fat_ff_threshold_sat) & (~exclusion) & (~abdominal_muscle_exclusion) & (~sat_vat_bone_exclusion)
+    fat_candidate_vat = signal & np.isfinite(ff) & (ff >= fat_ff_threshold_vat) & (~exclusion) & (~abdominal_muscle_exclusion) & (~sat_vat_bone_exclusion)
 
     sat_mask = np.zeros_like(fat_candidate_sat, dtype=bool)
     imat_mask = np.zeros_like(fat_candidate_imat, dtype=bool)
@@ -1186,6 +1490,7 @@ def build_sat_imat_masks(
     # estimate briefly collapses near the diaphragm.
     sat_pre_cavity_carve = np.zeros_like(fat_candidate_sat, dtype=bool)
     imat_pre_cavity_carve = np.zeros_like(fat_candidate_imat, dtype=bool)
+    fascia_mask_3d = np.zeros_like(fat_candidate_sat, dtype=bool)
 
     zdim = ff.shape[2]
     dilate_size = max(3, int(fascia_dilate_size))
@@ -1241,6 +1546,7 @@ def build_sat_imat_masks(
         else:
             fascia = np.zeros_like(body, dtype=bool)
 
+        fascia_mask_3d[:, :, z] = fascia
         imat_slice = fc_imat & fascia & (~muscle_union_eroded_for_fat)
         sat_slice = fc_sat & body & (~fascia)
 
@@ -1354,9 +1660,10 @@ def build_sat_imat_masks(
         vat_mask = np.zeros_like(fat_candidate_vat, dtype=bool)
 
     # Station-specific SAT classification:
-    #   Upper: use TotalSegmentator subcutaneous fat as a trusted seed and retain
-    #          the newer surface-constrained Dixon recovery process.
-    #   Lower: restore the original validated fascia-based SAT result generated
+    #   Upper: preferentially use TotalSegmentator tissue_types_mr/subcutaneous_fat
+    #          directly (generated from Dixon F when configured). Only minimal
+    #          overlap cleanup is applied; no FF-threshold regrowth is required.
+    #   Lower: preserve the original validated fascia-based SAT result generated
     #          during the slice-wise pass. Do not replace lower SAT with the
     #          TotalSegmentator subcutaneous-fat mask or run seeded recovery.
     if station_is_upper:
@@ -1365,15 +1672,32 @@ def build_sat_imat_masks(
             and use_totalseg_subcutaneous_fat_for_sat
             and np.any(subcutaneous_fat_direct)
         ):
+            # Use the learned TotalSegmentator SAT class itself as the Upper SAT
+            # segmentation. Keep only conservative overlap cleanup:
+            #   - stay inside the acquired body signal
+            #   - do not overlap muscle
+            #   - do not overlap VAT
+            #
+            # Intentionally DO NOT intersect with fat_candidate_sat here because
+            # that would re-impose the custom Dixon FF threshold on the learned
+            # tissue_types_mr segmentation we are trying to evaluate.
             sat_seed_mask = (
                 subcutaneous_fat_direct
                 & signal
-                & fat_candidate_sat
                 & (~muscle_exclusion_for_fat)
                 & (~vat_mask)
+                & (~sat_vat_bone_exclusion)
+            )
+            print(
+                "    Upper-station SAT logic: using TotalSegmentator "
+                "tissue_types_mr/subcutaneous_fat directly with overlap cleanup."
             )
         else:
             sat_seed_mask = sat_pre_cavity_carve & (~vat_mask)
+            print(
+                "    NOTE: Upper TotalSegmentator subcutaneous_fat unavailable; "
+                "using the previous fascia-based SAT fallback."
+            )
 
         sat_mask = sat_seed_mask.copy()
     else:
@@ -1386,28 +1710,145 @@ def build_sat_imat_masks(
     sat_recovery_added = np.zeros_like(sat_mask, dtype=bool)
     sat_surface_seed = np.zeros_like(sat_mask, dtype=bool)
 
+    # Upper recovery uses an independent, more permissive FF threshold so
+    # partial-volume gaps can be filled without changing the global SAT threshold.
+    upper_sat_recovery_candidate = (
+        signal
+        & np.isfinite(ff)
+        & (ff >= float(upper_sat_recovery_ff_threshold))
+        & (~exclusion)
+        & (~abdominal_muscle_exclusion)
+        & (~muscle_exclusion_for_fat)
+        & (~vat_mask)
+        & (~cavity_mask)
+        & (~direct_abdominal_cavity)
+        & (~trunk_cavity_exclusion)
+        & (~sat_vat_bone_exclusion)
+    )
+
     if station_is_upper and sat_recovery_enabled:
-        sat_mask, sat_recovery_added, sat_surface_seed = recover_upper_sat_mask(
+        sat_mask, sat_recovery_added = recover_upper_sat_mask_local(
             sat_seed=sat_seed_mask,
-            fat_candidate_sat=fat_candidate_sat,
+            fat_candidate_sat=upper_sat_recovery_candidate,
             signal=signal,
             muscle_exclusion=muscle_exclusion_for_fat,
             vat_mask=vat_mask,
-            cavity_mask=cavity_mask,
-            trunk_cavity_exclusion=trunk_cavity_exclusion,
             voxel_spacing=voxel_spacing,
             max_iterations=sat_recovery_iterations,
-            surface_band_mm=sat_surface_band_mm,
             close_mm=sat_recovery_close_mm,
-            min_component_ml=sat_recovery_min_component_ml,
+        )
+        # No independent surface seed is used in this conservative method.
+        sat_surface_seed = np.zeros_like(sat_mask, dtype=bool)
+        print(
+            "    Upper-station SAT local recovery: TotalSegmentator SAT plus "
+            f"adjacent Dixon-positive fill only (recovery FF>={float(upper_sat_recovery_ff_threshold):g}, "
+            f"iterations={int(sat_recovery_iterations)}, "
+            f"closing={float(sat_recovery_close_mm):g} mm; no surface-band seed)."
+        )
+
+
+    lower_sat_recovery_candidate = (
+        signal
+        & np.isfinite(ff)
+        & (ff >= float(lower_sat_recovery_ff_threshold))
+        & (~exclusion)
+        & (~abdominal_muscle_exclusion)
+        & (~muscle_exclusion_for_fat)
+        & (~vat_mask)
+        & (~fascia_mask_3d)
+    )
+
+    if (not station_is_upper) and lower_sat_recovery_enabled:
+        sat_mask, sat_recovery_added = recover_lower_sat_mask_local(
+            sat_seed=sat_seed_mask,
+            fat_candidate_sat=lower_sat_recovery_candidate,
+            signal=signal,
+            fascia_mask=fascia_mask_3d,
+            muscle_exclusion=muscle_exclusion_for_fat,
+            vat_mask=vat_mask,
+            voxel_spacing=voxel_spacing,
+            max_iterations=lower_sat_recovery_iterations,
+            close_mm=lower_sat_recovery_close_mm,
         )
         print(
-            "    Upper-station SAT recovery: TotalSegmentator SAT seed plus "
-            f"surface-constrained Dixon recovery (iterations={int(sat_recovery_iterations)}, "
-            f"surface band={float(sat_surface_band_mm):g} mm, "
-            f"closing={float(sat_recovery_close_mm):g} mm, "
-            f"minimum component={float(sat_recovery_min_component_ml):g} mL)."
+            "    Lower-station SAT local recovery: fascia-constrained adjacent "
+            f"Dixon-positive fill (recovery FF>={float(lower_sat_recovery_ff_threshold):g}, "
+            f"iterations={int(lower_sat_recovery_iterations)}, "
+            f"closing={float(lower_sat_recovery_close_mm):g} mm)."
         )
+
+    sat_before_hole_fill = sat_mask.copy()
+    sat_holes_filled = np.zeros_like(sat_mask, dtype=bool)
+    sat_arm_exclusion = np.zeros_like(sat_mask, dtype=bool)
+
+    if station_is_upper and upper_sat_fill_holes:
+        sat_mask, sat_holes_filled = fill_small_upper_sat_holes(
+            sat_mask=sat_mask,
+            allowed_mask=upper_sat_recovery_candidate,
+            voxel_spacing=voxel_spacing,
+            max_hole_ml=upper_sat_max_hole_ml,
+            close_mm=upper_sat_gap_fill_close_mm,
+        )
+        print(
+            "    Upper-station SAT safe local gap fill: closing-based Dixon-positive "
+            f"gaps only (radius={float(upper_sat_gap_fill_close_mm):g} mm, "
+            f"component <= {float(upper_sat_max_hole_ml):g} mL); "
+            "muscle/VAT/internal cavities excluded."
+        )
+
+
+    if (not station_is_upper) and lower_sat_fill_holes:
+        sat_mask, sat_holes_filled = fill_small_upper_sat_holes(
+            sat_mask=sat_mask,
+            allowed_mask=lower_sat_recovery_candidate,
+            voxel_spacing=voxel_spacing,
+            max_hole_ml=lower_sat_max_hole_ml,
+            close_mm=lower_sat_gap_fill_close_mm,
+        )
+        print(
+            "    Lower-station SAT safe local gap fill: fascia-constrained "
+            f"Dixon-positive gaps only (radius={float(lower_sat_gap_fill_close_mm):g} mm, "
+            f"component <= {float(lower_sat_max_hole_ml):g} mL)."
+        )
+
+    if station_is_upper and upper_sat_remove_arms:
+        # Use thoracic + abdominal cavities as the central torso anchor.
+        trunk_anchor = (
+            trunk_cavity_masks.get("thoracic_cavity", np.zeros_like(signal, dtype=bool))
+            | direct_abdominal_cavity
+            | cavity_mask
+        )
+        trunk_support = build_upper_trunk_support_mask(
+            signal=signal,
+            trunk_anchor=trunk_anchor,
+            erode_voxels=upper_sat_trunk_erode_voxels,
+        )
+        sat_before_trunk = sat_mask.copy()
+        sat_mask = sat_mask & trunk_support
+        sat_arm_exclusion = sat_before_trunk & (~sat_mask)
+        print(
+            "    Upper-station SAT trunk restriction: removed lateral arm SAT "
+            f"using cavity-anchored torso isolation (erosion={int(upper_sat_trunk_erode_voxels)} voxels)."
+        )
+
+    if station_is_upper and np.any(vertebrae_mr_exclusion):
+        sat_overlap_before = int(np.count_nonzero(sat_mask & vertebrae_mr_exclusion))
+        vat_overlap_before = int(np.count_nonzero(vat_mask & vertebrae_mr_exclusion))
+
+        sat_mask &= ~vertebrae_mr_exclusion
+        vat_mask &= ~vertebrae_mr_exclusion
+
+        sat_overlap_after = int(np.count_nonzero(sat_mask & vertebrae_mr_exclusion))
+        vat_overlap_after = int(np.count_nonzero(vat_mask & vertebrae_mr_exclusion))
+
+        print(
+            "    Upper vertebrae_mr exclusion QC: "
+            f"SAT overlap {sat_overlap_before} -> {sat_overlap_after} voxels; "
+            f"VAT overlap {vat_overlap_before} -> {vat_overlap_after} voxels."
+        )
+
+        if sat_overlap_after != 0 or vat_overlap_after != 0:
+            raise RuntimeError("Final SAT/VAT still overlaps vertebrae_mr exclusion.")
 
     if station_is_upper:
         # Upper-station IMAT is restricted to a tight skeletal-muscle neighborhood.
@@ -1519,6 +1960,18 @@ def build_sat_imat_masks(
     if sat_surface_seed_mask_out:
         save_like(ff_img, sat_surface_seed, sat_surface_seed_mask_out, dtype=np.uint8)
 
+    if sat_before_hole_fill_mask_out:
+        save_like(ff_img, sat_before_hole_fill, sat_before_hole_fill_mask_out, dtype=np.uint8)
+
+    if sat_holes_filled_mask_out:
+        save_like(ff_img, sat_holes_filled, sat_holes_filled_mask_out, dtype=np.uint8)
+
+    if sat_arm_exclusion_mask_out:
+        save_like(ff_img, sat_arm_exclusion, sat_arm_exclusion_mask_out, dtype=np.uint8)
+
+    if vertebrae_mr_exclusion_mask_out:
+        save_like(ff_img, vertebrae_mr_exclusion, vertebrae_mr_exclusion_mask_out, dtype=np.uint8)
+
     if eroded_seg_out:
         save_like(seg_img, seg_eroded, eroded_seg_out, dtype=np.int16)
 
@@ -1573,43 +2026,68 @@ def main():
     ap.add_argument("--sat_surface_band_mm", type=float, default=15.0)
     ap.add_argument("--sat_recovery_close_mm", type=float, default=5.0)
     ap.add_argument("--sat_recovery_min_component_ml", type=float, default=2.0)
+    ap.add_argument("--upper_sat_recovery_ff_threshold", type=float, default=0.20)
+    ap.add_argument("--disable_upper_sat_fill_holes", action="store_true")
+    ap.add_argument("--upper_sat_max_hole_ml", type=float, default=10.0)
+    ap.add_argument("--upper_sat_gap_fill_close_mm", type=float, default=4.0)
+    ap.add_argument("--disable_upper_sat_remove_arms", action="store_true")
+    ap.add_argument("--upper_sat_trunk_erode_voxels", type=int, default=4)
+    ap.add_argument("--lower_sat_recovery_ff_threshold", type=float, default=0.20)
+    ap.add_argument("--lower_sat_recovery_iterations", type=int, default=3)
+    ap.add_argument("--lower_sat_recovery_close_mm", type=float, default=2.0)
+    ap.add_argument("--lower_sat_max_hole_ml", type=float, default=5.0)
+    ap.add_argument("--lower_sat_gap_fill_close_mm", type=float, default=4.0)
+    ap.add_argument("--disable_lower_sat_recovery", action="store_true")
+    ap.add_argument("--disable_lower_sat_fill_holes", action="store_true")
+    ap.add_argument("--disable_totalseg_vertebrae_mr_exclusion", action="store_true")
+    ap.add_argument("--totalseg_vertebrae_mr_folder", default="TS_VERTEBRAE_MR")
     ap.add_argument("--save_sat_recovery_masks", action="store_true")
     args = ap.parse_args()
 
     base = args.dir
 
     # Metrics-only mode deliberately skips every segmentation-generation step.
-    # Existing masks in eroded_mask_for_qc are treated as the post-QC source of truth.
+    # Existing final masks in fat_compartment_masks are treated as the post-QC source of truth.
     if args.mode == "metrics":
         export_all_fat_compartment_metrics(base, args.subject, args.day)
         return
 
     w_path, f_path, ff_path, seg_path = find_required_dixon_inputs(base)
 
-    qc_dir = os.path.join(base, "eroded_mask_for_qc")
-    os.makedirs(qc_dir, exist_ok=True)
+    # Keep final fat-compartment masks separate from diagnostic/intermediate masks.
+    torso_fat_dir = os.path.join(base, "fat_compartment_masks")
+    misc_dir = os.path.join(base, "misc")
+    os.makedirs(torso_fat_dir, exist_ok=True)
+    os.makedirs(misc_dir, exist_ok=True)
 
-    # Keep all CSV outputs from this module together so QC masks and tabular
-    # analysis outputs are not mixed in the station folder.
+    # Keep all CSV outputs from this module together so tabular analysis outputs
+    # remain separate from NIfTI masks.
     csv_dir = os.path.join(base, "fat compartment csvs")
     os.makedirs(csv_dir, exist_ok=True)
 
-    eroded_seg_path = os.path.join(qc_dir, "Dixon_W_COMP_eroded_dseg.nii.gz")
-    sat_mask_path = os.path.join(qc_dir, "SAT_mask.nii.gz")
-    imat_mask_path = os.path.join(qc_dir, "IMAT_mask.nii.gz")
-    vat_mask_path = os.path.join(qc_dir, "VAT_mask.nii.gz")
-    cavity_mask_path = os.path.join(qc_dir, "Abdominal_cavity_mask.nii.gz")
-    abdominal_muscles_mask_path = os.path.join(qc_dir, "Abdominal_muscles_mask.nii.gz")
-    torso_fat_mask_path = os.path.join(qc_dir, "TS_torso_fat_for_VAT_mask.nii.gz")
-    subcutaneous_fat_mask_path = os.path.join(qc_dir, "TS_subcutaneous_fat_for_SAT_mask.nii.gz")
-    trunk_cavity_exclusion_mask_path = os.path.join(qc_dir, "TS_trunk_cavity_exclusion_mask.nii.gz")
-    thoracic_trunk_fat_labels_path = os.path.join(qc_dir, "Thoracic_trunk_fat_labels.nii.gz")
-    thoracic_trunk_fat_labels_csv_path = os.path.join(qc_dir, "Thoracic_trunk_fat_labels.csv")
-    thoracic_trunk_fat_labels_ctbl_path = os.path.join(qc_dir, "Thoracic_trunk_fat_labels.ctbl")
-    pericardial_fat_mask_path = os.path.join(qc_dir, "PericardialFat_mask.nii.gz")
-    sat_seed_mask_path = os.path.join(qc_dir, "SAT_mask_seed.nii.gz")
-    sat_recovery_added_mask_path = os.path.join(qc_dir, "SAT_mask_recovery_added.nii.gz")
-    sat_surface_seed_mask_path = os.path.join(qc_dir, "SAT_mask_surface_seed.nii.gz")
+    # Final masks intended for routine analysis/QC.
+    sat_mask_path = os.path.join(torso_fat_dir, "SAT_mask.nii.gz")
+    imat_mask_path = os.path.join(torso_fat_dir, "IMAT_mask.nii.gz")
+    vat_mask_path = os.path.join(torso_fat_dir, "VAT_mask.nii.gz")
+    thoracic_trunk_fat_labels_path = os.path.join(torso_fat_dir, "Thoracic_trunk_fat_labels.nii.gz")
+    pericardial_fat_mask_path = os.path.join(torso_fat_dir, "PericardialFat_mask.nii.gz")
+
+    # Intermediate/QC masks generated by the fat-compartment module.
+    eroded_seg_path = os.path.join(base, "Dixon_MuscleMap_Mask_eroded.nii.gz")
+    cavity_mask_path = os.path.join(misc_dir, "Abdominal_cavity_mask.nii.gz")
+    abdominal_muscles_mask_path = os.path.join(misc_dir, "Abdominal_muscles_mask.nii.gz")
+    torso_fat_mask_path = os.path.join(misc_dir, "TS_torso_fat_for_VAT_mask.nii.gz")
+    subcutaneous_fat_mask_path = os.path.join(misc_dir, "TS_subcutaneous_fat_for_SAT_mask.nii.gz")
+    trunk_cavity_exclusion_mask_path = os.path.join(misc_dir, "TS_trunk_cavity_exclusion_mask.nii.gz")
+    thoracic_trunk_fat_labels_csv_path = os.path.join(misc_dir, "Thoracic_trunk_fat_labels.csv")
+    thoracic_trunk_fat_labels_ctbl_path = os.path.join(misc_dir, "Thoracic_trunk_fat_labels.ctbl")
+    sat_seed_mask_path = os.path.join(misc_dir, "SAT_mask_seed.nii.gz")
+    sat_recovery_added_mask_path = os.path.join(misc_dir, "SAT_mask_recovery_added.nii.gz")
+    sat_surface_seed_mask_path = os.path.join(misc_dir, "SAT_mask_surface_seed.nii.gz")
+    sat_before_hole_fill_mask_path = os.path.join(misc_dir, "SAT_mask_before_hole_fill.nii.gz")
+    sat_holes_filled_mask_path = os.path.join(misc_dir, "SAT_holes_filled.nii.gz")
+    sat_arm_exclusion_mask_path = os.path.join(misc_dir, "SAT_arm_exclusion_mask.nii.gz")
+    vertebrae_mr_exclusion_mask_path = os.path.join(misc_dir, "VertebraeMR_exclusion_mask.nii.gz")
 
     print("Building SAT, IMAT, VAT, abdominal cavity, and thoracic trunk fat QC masks")
     build_sat_imat_masks(
@@ -1657,9 +2135,28 @@ def main():
         sat_surface_band_mm=args.sat_surface_band_mm,
         sat_recovery_close_mm=args.sat_recovery_close_mm,
         sat_recovery_min_component_ml=args.sat_recovery_min_component_ml,
+        upper_sat_recovery_ff_threshold=args.upper_sat_recovery_ff_threshold,
+        upper_sat_fill_holes=not args.disable_upper_sat_fill_holes,
+        upper_sat_max_hole_ml=args.upper_sat_max_hole_ml,
+        upper_sat_gap_fill_close_mm=args.upper_sat_gap_fill_close_mm,
+        upper_sat_remove_arms=not args.disable_upper_sat_remove_arms,
+        upper_sat_trunk_erode_voxels=args.upper_sat_trunk_erode_voxels,
+        lower_sat_recovery_enabled=not args.disable_lower_sat_recovery,
+        lower_sat_recovery_ff_threshold=args.lower_sat_recovery_ff_threshold,
+        lower_sat_recovery_iterations=args.lower_sat_recovery_iterations,
+        lower_sat_recovery_close_mm=args.lower_sat_recovery_close_mm,
+        lower_sat_fill_holes=not args.disable_lower_sat_fill_holes,
+        lower_sat_max_hole_ml=args.lower_sat_max_hole_ml,
+        lower_sat_gap_fill_close_mm=args.lower_sat_gap_fill_close_mm,
+        use_totalseg_vertebrae_mr_exclusion=not args.disable_totalseg_vertebrae_mr_exclusion,
+        totalseg_vertebrae_mr_folder=args.totalseg_vertebrae_mr_folder,
+        vertebrae_mr_exclusion_mask_out=vertebrae_mr_exclusion_mask_path if args.save_sat_recovery_masks else None,
         sat_seed_mask_out=sat_seed_mask_path if args.save_sat_recovery_masks else None,
         sat_recovery_added_mask_out=sat_recovery_added_mask_path if args.save_sat_recovery_masks else None,
         sat_surface_seed_mask_out=sat_surface_seed_mask_path if args.save_sat_recovery_masks else None,
+        sat_before_hole_fill_mask_out=sat_before_hole_fill_mask_path if args.save_sat_recovery_masks else None,
+        sat_holes_filled_mask_out=sat_holes_filled_mask_path if args.save_sat_recovery_masks else None,
+        sat_arm_exclusion_mask_out=sat_arm_exclusion_mask_path if args.save_sat_recovery_masks else None,
     )
 
     if args.mode == "build_and_metrics":
@@ -1700,6 +2197,16 @@ def run_fat_compartments(station_dir, cfg):
         "--sat_surface_band_mm", str(cfg.get("sat_surface_band_mm", 15.0)),
         "--sat_recovery_close_mm", str(cfg.get("sat_recovery_close_mm", 5.0)),
         "--sat_recovery_min_component_ml", str(cfg.get("sat_recovery_min_component_ml", 2.0)),
+        "--upper_sat_recovery_ff_threshold", str(cfg.get("upper_sat_recovery_ff_threshold", 0.20)),
+        "--upper_sat_max_hole_ml", str(cfg.get("upper_sat_max_hole_ml", 10.0)),
+        "--upper_sat_gap_fill_close_mm", str(cfg.get("upper_sat_gap_fill_close_mm", 4.0)),
+        "--upper_sat_trunk_erode_voxels", str(cfg.get("upper_sat_trunk_erode_voxels", 4)),
+        "--lower_sat_recovery_ff_threshold", str(cfg.get("lower_sat_recovery_ff_threshold", 0.20)),
+        "--lower_sat_recovery_iterations", str(cfg.get("lower_sat_recovery_iterations", 3)),
+        "--lower_sat_recovery_close_mm", str(cfg.get("lower_sat_recovery_close_mm", 2.0)),
+        "--lower_sat_max_hole_ml", str(cfg.get("lower_sat_max_hole_ml", 5.0)),
+        "--lower_sat_gap_fill_close_mm", str(cfg.get("lower_sat_gap_fill_close_mm", 4.0)),
+        "--totalseg_vertebrae_mr_folder", str(cfg.get("totalseg_vertebrae_mr_folder", "TS_VERTEBRAE_MR")),
     ]
 
     if not cfg.get("use_totalseg_abdominal_cavity", True):
@@ -1722,6 +2229,21 @@ def run_fat_compartments(station_dir, cfg):
 
     if not cfg.get("sat_recovery_enabled", True):
         sys.argv += ["--disable_sat_recovery"]
+
+    if not cfg.get("upper_sat_fill_holes", True):
+        sys.argv += ["--disable_upper_sat_fill_holes"]
+
+    if not cfg.get("upper_sat_remove_arms", True):
+        sys.argv += ["--disable_upper_sat_remove_arms"]
+
+    if not cfg.get("lower_sat_recovery_enabled", True):
+        sys.argv += ["--disable_lower_sat_recovery"]
+
+    if not cfg.get("lower_sat_fill_holes", True):
+        sys.argv += ["--disable_lower_sat_fill_holes"]
+
+    if not cfg.get("use_totalseg_vertebrae_mr_exclusion", True):
+        sys.argv += ["--disable_totalseg_vertebrae_mr_exclusion"]
 
     if cfg.get("save_sat_recovery_masks", False):
         sys.argv += ["--save_sat_recovery_masks"]

@@ -1,6 +1,6 @@
 {
   "study_name": "ASHA",
-  "data_root": "C:\\Users\\kadav\\Documents\\MATLab Code Offline\\APAI-WBS-MMv1.4/data/ASHA",
+  "data_root": "C:\\Research\\WholeBodySeg\\data\\ASHA",
   "subjects": [
     "P010"
   ],
@@ -36,9 +36,9 @@
   "skip_musclemap_t2_448_seg": false,
   "skip_musclemap_t2_448_metrics": false,
   "session_folder_name": "Musclemap Data",
-  "dcm2niix_path": "C:\\Users\\kadav\\Documents\\MATLab Code Offline\\APAI-WBS-MMv1.4/tools/dcm2niix.exe",
-  "musclemap_repo": "C:\\Users\\kadav\\Documents\\MATLab Code Offline\\APAI-WBS-MMv1.4/MuscleMap",
-  "code_dir": "C:\\Users\\kadav\\Documents\\MATLab Code Offline\\APAI-WBS-MMv1.4",
+  "dcm2niix_path": "C:\\Research\\WholeBodySeg\\tools\\dcm2niix.exe",
+  "musclemap_repo": "C:\\Research\\WholeBodySeg\\MuscleMap",
+  "code_dir": "C:\\Research\\WholeBodySeg",
   "compute_mode": "auto",
   "signal_threshold": 50.0,
   "fat_ff_threshold_imat": 0.3,

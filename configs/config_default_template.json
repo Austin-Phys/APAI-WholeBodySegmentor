@@ -26,7 +26,7 @@
   "run_totalseg_extra_subtasks": true,
   "include_extra_subtasks_in_combined_label": true,
   "totalseg_extra_subtasks": [
-    "thigh_shoulder_muscles_mr"
+    // "thigh_shoulder_muscles_mr"
   ],
   "totalseg_qc_only_subtasks": [
     "tissue_types_mr",
